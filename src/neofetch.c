@@ -26,7 +26,7 @@ void cmd_neofetch(void)
     /* Line 0: logo + OS */
     vga_print_color(LOGO[0], 0x0F);
     vga_print_color("  OS      ", 0x0A);
-    vga_print("ArchaOS v0.4 \"IRQ\"\n");
+    vga_print("ArchaOS v4.0 \"Phosphor\"\n");
 
     /* Line 1: logo + Kernel */
     vga_print_color(LOGO[1], 0x0F);

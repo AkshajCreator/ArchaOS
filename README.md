@@ -8,7 +8,7 @@ It boots from an ISO image into a fully custom kernel featuring a Brand new **VG
 
 ---
 
-## ✨ What's in v4.0
+## ✨ What's in v4.0 "Phosphor"
 
 ### Graphical Desktop (Mode 13h — 320×200, 256 colours)
 - Full **window manager** — drag, minimize, maximize (fullscreen), split-screen snap, close

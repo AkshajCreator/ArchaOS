@@ -548,7 +548,7 @@ void kernel_execute_command(const char *cmd)
     }
     else if (strcmp(cmd, "$VERSION") == 0)
     {
-        vga_print("ArchaOS v0.4 \"IRQ\"\n");
+        vga_print("ArchaOS v4.0 \"Phosphor\"\n");
     }
     else if (strcmp(cmd, "ports") == 0)
     {

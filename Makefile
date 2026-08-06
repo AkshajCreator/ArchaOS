@@ -1,4 +1,4 @@
-# Makefile — ArchaOS v0.4
+# Makefile — ArchaOS v4.0 "Phosphor"
 
 CC      = gcc
 AS      = nasm

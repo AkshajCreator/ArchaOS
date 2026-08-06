@@ -392,7 +392,7 @@ void vga_show_welcome(void)
 
     /* Version — right-aligned under logo */
     delay(30000000);
-    const char *ver = "v0.4  \"IRQ\"";
+    const char *ver = "v4.0  \"Phosphor\"";
     int ver_len = strlen_local(ver);
     int ver_y   = logo_sy + logo_h + 1;
     int ver_x   = logo_sx + logo_w - ver_len;

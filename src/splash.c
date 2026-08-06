@@ -100,7 +100,7 @@ static void draw_border(void)
 }
 
 /* ── Version right-aligned ── */
-static const char *VERSION = "v0.4 \"IRQ\"";
+static const char *VERSION = "v4.0 \"Phosphor\"";
 static void draw_version(void)
 {
     int vlen=0; while (VERSION[vlen]) vlen++;
