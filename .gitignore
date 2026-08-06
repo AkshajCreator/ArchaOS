@@ -1,0 +1,14 @@
+# Build output
+build/
+*.o
+*.bin
+*.iso
+
+# Editor junk
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
