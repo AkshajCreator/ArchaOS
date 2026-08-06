@@ -2,7 +2,7 @@
 
 **ArchaOS** is a hobby 32-bit x86 operating system written entirely from scratch in **C** and **x86 Assembly** — no libc, no Linux, no borrowed kernel code.
 
-It boots from an ISO image into a fully custom kernel featuring a Brand new **VGA graphical desktop environment**, an already existin complete **interactive CLI shell**, a **virtual filesystem**, a super simple **memory manager**, and a small suite of built-in GUI applications.
+It boots from an ISO image into a fully custom kernel featuring a brand-new **VGA graphical desktop environment**, an existing complete **interactive CLI shell**, a **virtual filesystem**, a super-simple **memory manager**, and a small suite of built-in GUI applications.
 
 > ⚠ArchaOS is a hobby project
 
@@ -11,7 +11,7 @@ It boots from an ISO image into a fully custom kernel featuring a Brand new **VG
 ## ✨ What's in v4.0 "Phosphor"
 
 ### Graphical Desktop (Mode 13h — 320×200, 256 colours)
-- Full **window manager** — drag, minimize, maximize (fullscreen), split-screen snap, close
+- Full **window manager** — drag, minimise, maximise (fullscreen), split-screen snap, close
 - **100% double-buffered** rendering — zero tearing, zero flickering, zero mouse trails
 - **PS/2 mouse** support with hardware-accurate 3-byte packet parsing
 - **Adaptive ProcessBar** (taskbar) with pixel-art program icons that scales with open windows
@@ -146,7 +146,7 @@ ArchaOS/
 
 - Type `gui` in the shell to launch the graphical desktop
 - Press **ESC** inside the GUI to return to the shell
-- **Right-click** in Minesweeper to place / remove a flag
+- **Right-click** in Minesweeper to place/remove a flag
 - Type `help` in the shell for a full command list
 - Theme and wallpaper changes in Control Panel are persisted in `archaos.conf`
 
