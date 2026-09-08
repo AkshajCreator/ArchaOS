@@ -14,6 +14,10 @@
 #define ATTR_BRIGHT_GREEN   ATTR(0xA, 0x0)
 #define ATTR_GREEN          ATTR(0x2, 0x0)
 
+#include "multiboot.h"
+
+void vga_write_cell(int x, int y, uint16_t cell);
+uint16_t vga_read_cell(int x, int y);
 void vga_clear(void);
 void vga_print(const char *str);
 void vga_print_char(char c);
@@ -26,8 +30,15 @@ void vga_scroll(void);
 void vga_scroll_up(int lines);
 void vga_scroll_down(int lines);
 int  vga_in_scrollback(void);
-void vga_ensure_visible(void);
 void vga_execute_command(const char *cmd);
 void vga_kbd_flush(void);
+void vga_get_input(const char *prompt_str, char *out_buf, int max_len);
+
+/* Hardware VGA Mode Switching (Mode 13h 320x200 256-color & Text Mode) */
+void vga_set_mode13h(void);
+void vga_set_text_mode(void);
+void vga_font_backup_save(uint8_t *font_buf);
+void vga_restore_text_palette(void);
+void vga_restore_font_and_text(uint8_t *font_buf);
 
 #endif

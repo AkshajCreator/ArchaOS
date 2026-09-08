@@ -1,34 +1,27 @@
 ENTRY(_start)
 
-PHDRS
-{
-    text PT_LOAD FLAGS(5);   /* Read + Execute (4|1) */
-    rodata PT_LOAD FLAGS(4); /* Read-only (4) */
-    data PT_LOAD FLAGS(6);   /* Read + Write (4|2) */
-}
-
 SECTIONS
 {
     . = 1M;
 
-    .text :
+    .text ALIGN(4K) :
     {
         *(.text*)
-    } :text
+    }
 
-    .rodata :
+    .rodata ALIGN(4K) :
     {
         *(.rodata*)
-    } :rodata
+    }
 
-    .data :
+    .data ALIGN(4K) :
     {
         *(.data*)
-    } :data
+    }
 
-    .bss :
+    .bss ALIGN(4K) :
     {
         *(.bss*)
         *(COMMON)
-    } :data
+    }
 }

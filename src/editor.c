@@ -1,4 +1,4 @@
-// src/editor.c — minimal full-screen text editor
+// src/editor.c — ArchaOS GNU nano interactive text editor
 
 #include "editor.h"
 #include "fs.h"
@@ -8,112 +8,172 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define ED_MAX    2048
-/* VGA_WIDTH and VGA_HEIGHT come from vga.h */
-#define VGA_W  VGA_WIDTH
-#define ED_VGA_H VGA_HEIGHT
-#define ED_TOP    1                  /* first text row (row 0 = top status)  */
-#define ED_BOT    (ED_VGA_H - 2)     /* last text row  (row 24 = bot status) */
-#define ED_ROWS   (ED_BOT - ED_TOP + 1)   /* = 23 usable rows                */
+#define ED_MAX    4096
+#define VGA_W     VGA_WIDTH
+#define ED_VGA_H  VGA_HEIGHT
+#define ED_TOP    1                  /* first text row */
+#define ED_BOT    21                 /* last text row (rows 1..21) */
+#define ED_ROWS   (ED_BOT - ED_TOP + 1)
+#define ED_MSG_Y  22                 /* message / status row */
+#define ED_KEY_Y1 23                 /* shortcut bar row 1 */
+#define ED_KEY_Y2 24                 /* shortcut bar row 2 */
 
-static uint16_t *vga = (uint16_t *)0xB8000;
-
-#define ATTR_STATUS  0x2F   /* black on green  */
+#define ATTR_HEADER   0x70           /* black on light gray */
+#define ATTR_KEY_INV  0x70           /* black on light gray (for "^X", "^O") */
+#define ATTR_KEY_TXT  0x07           /* white on black (for labels) */
+#define ATTR_MSG      0x0E           /* yellow on black */
 #undef  ATTR_NORMAL
-#define ATTR_NORMAL  0x07   /* white on black  */
-#define ATTR_BRIGHT  0x0F   /* bright white    */
+#define ATTR_NORMAL   0x07           /* white on black */
+#define ATTR_BRIGHT   0x0F           /* bright white */
 
-/* ── port I/O ─────────────────────────────────────────── */
-static inline void outb(uint16_t port, uint8_t val)
-{ asm volatile("outb %0,%1"::"a"(val),"Nd"(port)); }
-
-/* ── low-level VGA helpers ────────────────────────────── */
 static void ed_cur(int x, int y)
 {
-    uint16_t pos = (uint16_t)(y * VGA_W + x);
-    outb(0x3D4, 0x0F); outb(0x3D5,  pos & 0xFF);
-    outb(0x3D4, 0x0E); outb(0x3D5, (pos >> 8) & 0xFF);
+    vga_set_cursor(x, y);
 }
 
 static void ed_putc(int x, int y, char c, uint8_t attr)
-{ vga[y * VGA_W + x] = ((uint16_t)(unsigned char)c) | ((uint16_t)attr << 8); }
+{
+    if (x < 0 || x >= VGA_W || y < 0 || y >= ED_VGA_H) return;
+    vga_write_cell(x, y, ((uint16_t)(unsigned char)c) | ((uint16_t)attr << 8));
+}
 
 static void ed_str(int x, int y, const char *s, uint8_t attr)
-{ while (*s) ed_putc(x++, y, *s++, attr); }
+{
+    while (*s && x < VGA_W) ed_putc(x++, y, *s++, attr);
+}
 
 static void ed_fill(int y, uint8_t attr)
-{ for (int x = 0; x < VGA_W; x++) ed_putc(x, y, ' ', attr); }
-
-/* ── draw the whole editor screen ────────────────────── */
-static void ed_draw(const char *buf, int len, int cur, const char *fname)
 {
-    /* ---- top status bar (row 0) ---- */
-    ed_fill(0, ATTR_STATUS);
-    ed_str(1,  0, "EDITOR: ",             ATTR_STATUS);
-    ed_str(9,  0, fname,                  ATTR_STATUS);
-    ed_str(55, 0, "Ctrl+S=Save  ESC=Quit", ATTR_STATUS);
+    for (int x = 0; x < VGA_W; x++) ed_putc(x, y, ' ', attr);
+}
 
-    /* ---- clear text area (rows ED_TOP .. ED_BOT) ---- */
+static void draw_shortcut(int x, int y, const char *key, const char *desc)
+{
+    ed_str(x, y, key, ATTR_KEY_INV);
+    ed_putc(x + 2, y, ' ', ATTR_KEY_TXT);
+    ed_str(x + 3, y, desc, ATTR_KEY_TXT);
+}
+
+static int ed_word_len(const char *buf, int start, int total) {
+    int l = 0;
+    while (start + l < total && buf[start + l] != ' ' && buf[start + l] != '\t' && buf[start + l] != '\n') {
+        l++;
+    }
+    return l;
+}
+
+/* ── draw the whole nano screen ────────────────────── */
+static void ed_draw(const char *buf, int len, int cur, const char *fname, int modified, const char *msg)
+{
+    /* ---- Row 0: nano header bar ---- */
+    ed_fill(0, ATTR_HEADER);
+    ed_str(2,  0, "GNU nano 0.5.0", ATTR_HEADER);
+    ed_str(26, 0, "File: ",        ATTR_HEADER);
+    ed_str(32, 0, fname,           ATTR_HEADER);
+    if (modified) {
+        ed_str(68, 0, "[Modified]", ATTR_HEADER);
+    }
+
+    /* ---- Rows 1..21: clear text area ---- */
     for (int y = ED_TOP; y <= ED_BOT; y++) ed_fill(y, ATTR_NORMAL);
 
-    /* ---- render text ----
-     * Key rule: advance row BEFORE drawing when we hit column 80 or \n,
-     * but only draw the character if it's a printable (not \n itself).       */
+    /* ---- Render text buffer with word wrap ---- */
     int tx = 0, ty = ED_TOP;
     for (int i = 0; i < len && ty <= ED_BOT; i++)
     {
         if (buf[i] == '\n')
         {
-            tx = 0; ty++;            /* newline: just move down, draw nothing */
+            tx = 0; ty++;
+        }
+        else if (buf[i] == ' ' || buf[i] == '\t')
+        {
+            if (tx >= VGA_W - 1) { tx = 0; ty++; }
+            else {
+                if (ty <= ED_BOT) ed_putc(tx, ty, buf[i], ATTR_BRIGHT);
+                tx++;
+            }
         }
         else
         {
-            if (tx >= VGA_W) { tx = 0; ty++; }   /* soft-wrap before drawing */
-                if (ty <= ED_BOT)
-                    ed_putc(tx, ty, buf[i], ATTR_BRIGHT);
+            if (i == 0 || buf[i - 1] == ' ' || buf[i - 1] == '\t' || buf[i - 1] == '\n') {
+                int wlen = ed_word_len(buf, i, len);
+                if (tx + wlen > VGA_W && wlen < VGA_W && tx > 0) {
+                    tx = 0; ty++;
+                }
+            }
+            if (tx >= VGA_W) { tx = 0; ty++; }
+            if (ty <= ED_BOT)
+                ed_putc(tx, ty, buf[i], ATTR_BRIGHT);
             tx++;
         }
     }
 
-    /* ---- compute cursor screen position ---- */
+    /* ---- Compute cursor screen position with word wrap ---- */
     int cx = 0, cy = ED_TOP;
-    for (int i = 0; i < cur && cy <= ED_BOT; i++)
+    int cur_line = 1, cur_col = 1;
+    for (int i = 0; i < cur; i++)
     {
-        if (buf[i] == '\n')
-        { cx = 0; cy++; }
-        else
-        {
+        if (buf[i] == '\n') {
+            cur_line++;
+            cur_col = 1;
+            cx = 0;
+            cy++;
+        } else if (buf[i] == ' ' || buf[i] == '\t') {
+            cur_col++;
+            if (cx >= VGA_W - 1) { cx = 0; cy++; }
+            else cx++;
+        } else {
+            cur_col++;
+            if (i == 0 || buf[i - 1] == ' ' || buf[i - 1] == '\t' || buf[i - 1] == '\n') {
+                int wlen = ed_word_len(buf, i, len);
+                if (cx + wlen > VGA_W && wlen < VGA_W && cx > 0) {
+                    cx = 0; cy++;
+                }
+            }
             if (cx >= VGA_W) { cx = 0; cy++; }
             cx++;
         }
     }
-    /* clamp cursor inside text area */
-    if (cy > ED_BOT) { cy = ED_BOT; cx = VGA_W - 1; }
+    if (cx >= VGA_W) cx = VGA_W - 1;
+    if (cy > ED_BOT) cy = ED_BOT;
 
-    /* ---- bottom status bar (row ED_VGA_H-1 = 24) ---- */
-    ed_fill(ED_VGA_H - 1, ATTR_STATUS);
+    /* ---- Row 22: Message / Status Bar ---- */
+    ed_fill(ED_MSG_Y, ATTR_NORMAL);
+    if (msg && msg[0]) {
+        ed_str(2, ED_MSG_Y, msg, ATTR_MSG);
+    } else {
+        char status[64];
+        char num[16];
+        int pos = 0;
+        status[pos++] = '['; status[pos++] = ' ';
+        status[pos++] = 'L'; status[pos++] = 'n'; status[pos++] = ' ';
+        int v = cur_line, di = 0;
+        do { num[di++] = '0' + (v % 10); v /= 10; } while (v);
+        for (int k = di - 1; k >= 0; k--) status[pos++] = num[k];
 
-    /* "Ln N  Col N" */
-    char tmp[32];
-    int  ln  = cy - ED_TOP + 1;
-    int  col = cx + 1;
-    int  pi  = 0;
+        status[pos++] = ','; status[pos++] = ' ';
+        status[pos++] = 'C'; status[pos++] = 'o'; status[pos++] = 'l'; status[pos++] = ' ';
+        v = cur_col; di = 0;
+        do { num[di++] = '0' + (v % 10); v /= 10; } while (v);
+        for (int k = di - 1; k >= 0; k--) status[pos++] = num[k];
 
-    tmp[pi++] = 'L'; tmp[pi++] = 'n'; tmp[pi++] = ' ';
-    /* itoa ln */
-    char digits[8]; int di = 0;
-    int v = ln; do { digits[di++] = '0' + v % 10; v /= 10; } while (v);
-    for (int i = di - 1; i >= 0; i--) tmp[pi++] = digits[i];
+        status[pos++] = ' '; status[pos++] = ']';
+        status[pos] = '\0';
+        ed_str(2, ED_MSG_Y, status, ATTR_KEY_TXT);
+    }
 
-    tmp[pi++] = ' '; tmp[pi++] = ' ';
-    tmp[pi++] = 'C'; tmp[pi++] = 'o'; tmp[pi++] = 'l'; tmp[pi++] = ' ';
-    /* itoa col */
-    di = 0; v = col;
-    do { digits[di++] = '0' + v % 10; v /= 10; } while (v);
-    for (int i = di - 1; i >= 0; i--) tmp[pi++] = digits[i];
-    tmp[pi] = '\0';
+    /* ---- Rows 23 & 24: Classic GNU nano Shortcut Bar ---- */
+    ed_fill(ED_KEY_Y1, ATTR_NORMAL);
+    draw_shortcut(1,  ED_KEY_Y1, "^G", "Get Help");
+    draw_shortcut(20, ED_KEY_Y1, "^O", "WriteOut");
+    draw_shortcut(40, ED_KEY_Y1, "^W", "Where Is");
+    draw_shortcut(60, ED_KEY_Y1, "^K", "Cut Text");
 
-    ed_str(1, ED_VGA_H - 1, tmp, ATTR_STATUS);
+    ed_fill(ED_KEY_Y2, ATTR_NORMAL);
+    draw_shortcut(1,  ED_KEY_Y2, "^X", "Exit");
+    draw_shortcut(20, ED_KEY_Y2, "^R", "Read File");
+    draw_shortcut(40, ED_KEY_Y2, "^\\", "Replace");
+    draw_shortcut(60, ED_KEY_Y2, "^U", "Paste Text");
 
     ed_cur(cx, cy);
 }
@@ -121,7 +181,7 @@ static void ed_draw(const char *buf, int len, int cur, const char *fname)
 /* ── wait for next key scancode via IRQ1 ────────────── */
 static uint8_t ed_scancode(void)
 {
-    while (!irq_kbd_fired) asm volatile("hlt");
+    while (!irq_kbd_fired) asm volatile("sti; hlt");
     uint8_t sc    = last_scancode;
     irq_kbd_fired = 0;
     return sc;
@@ -141,7 +201,6 @@ static const char map_hi[128] = {
     'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',
 };
 
-/* ── translate scancode → character ─────────────────── */
 static char ed_translate(uint8_t sc, int shift, int caps)
 {
     if (sc >= 128) return 0;
@@ -153,20 +212,24 @@ static char ed_translate(uint8_t sc, int shift, int caps)
     return c;
 }
 
-/* ── main editor entry point ─────────────────────────── */
+/* ── main nano entry point ───────────────────────────── */
 void editor_open(const char *path)
 {
     static char buf[ED_MAX];
+    static char cut_buf[512] = "";
+    static char msg_buf[64] = "";
     int len = 0, cur = 0;
     int shift = 0, ctrl = 0, caps = 0, ext = 0;
+    int modified = 0;
 
-    /* load existing file content */
+    /* Load existing file content */
     buf[0] = '\0';
+    msg_buf[0] = '\0';
     if (fs_cat(path, buf, ED_MAX) == 0) {
         while (buf[len]) len++;
     }
 
-    ed_draw(buf, len, cur, path);
+    ed_draw(buf, len, cur, path, modified, msg_buf);
 
     while (1)
     {
@@ -181,111 +244,173 @@ void editor_open(const char *path)
             uint8_t b = sc & 0x7F;
             if (b == 0x2A || b == 0x36) shift = 0;
             if (b == 0x1D)              ctrl  = 0;
-            /* do NOT clear ext here — release of extended key is 0xE0 0x??|0x80 */
+            ext = 0;
             continue;
         }
 
         /* modifier press */
         if (sc == 0x2A || sc == 0x36) { shift = 1; ext = 0; continue; }
         if (sc == 0x1D)               { ctrl  = 1; ext = 0; continue; }
-        if (sc == 0x3A)               { caps  = !caps; ext = 0; continue; } /* Caps Lock */
+        if (sc == 0x3A)               { caps  = !caps; ext = 0; continue; }
 
-            /* ---- extended (arrow / nav) keys ---- */
-            if (ext)
+        /* Clear transient message on typing or movement */
+        msg_buf[0] = '\0';
+
+        /* ---- extended (arrow / nav) keys ---- */
+        if (ext)
+        {
+            ext = 0;
+            switch (sc)
             {
-                ext = 0;
-                switch (sc)
-                {
-                    case 0x4B:  /* Left */
-                        if (cur > 0) cur--;
-                        break;
-                    case 0x4D:  /* Right */
-                        if (cur < len) cur++;
-                        break;
-                    case 0x48:  /* Up — move to same column on previous line */
-                        if (cur > 0)
-                        {
-                            cur--;
-                            while (cur > 0 && buf[cur - 1] != '\n') cur--;
-                        }
-                        break;
-                    case 0x50:  /* Down — move to start of next line */
-                        while (cur < len && buf[cur] != '\n') cur++;
-                        if (cur < len) cur++;
-                        break;
-                    case 0x47:  /* Home — start of line */
+                case 0x4B:  /* Left */
+                    if (cur > 0) cur--;
+                    break;
+                case 0x4D:  /* Right */
+                    if (cur < len) cur++;
+                    break;
+                case 0x48:  /* Up */
+                    if (cur > 0)
+                    {
+                        cur--;
                         while (cur > 0 && buf[cur - 1] != '\n') cur--;
-                        break;
-                    case 0x4F:  /* End — end of line */
-                        while (cur < len && buf[cur] != '\n') cur++;
-                        break;
-                }
-                ed_draw(buf, len, cur, path);
-                continue;
+                    }
+                    break;
+                case 0x50:  /* Down */
+                    while (cur < len && buf[cur] != '\n') cur++;
+                    if (cur < len) cur++;
+                    break;
+                case 0x47:  /* Home */
+                    while (cur > 0 && buf[cur - 1] != '\n') cur--;
+                    break;
+                case 0x4F:  /* End */
+                    while (cur < len && buf[cur] != '\n') cur++;
+                    break;
+                case 0x53:  /* Delete */
+                    if (cur < len)
+                    {
+                        for (int i = cur; i < len - 1; i++) buf[i] = buf[i + 1];
+                        len--;
+                        buf[len] = '\0';
+                        modified = 1;
+                    }
+                    break;
             }
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+            continue;
+        }
 
-            /* ---- ESC: quit without save ---- */
-            if (sc == 0x01) break;
+        /* ---- ESC or Ctrl+X: Exit nano ---- */
+        if (sc == 0x01 || (ctrl && sc == 0x2D)) break;
 
-            /* ---- Ctrl+S: save and quit ---- */
-            if (ctrl && sc == 0x1F)
-            {
-                size_t slen = 0;
-                while (buf[slen]) slen++;
-                fs_write(path, buf, slen);
-                break;
-            }
+        /* ---- Ctrl+O or Ctrl+S: WriteOut / Save to disk ---- */
+        if (ctrl && (sc == 0x18 || sc == 0x1F))
+        {
+            size_t slen = 0;
+            while (buf[slen]) slen++;
+            fs_write(path, buf, slen);
+            modified = 0;
 
-            /* ---- Backspace ---- */
-            if (sc == 0x0E)
-            {
-                if (cur > 0)
-                {
-                    for (int i = cur - 1; i < len - 1; i++) buf[i] = buf[i + 1];
-                    len--; cur--;
-                    buf[len] = '\0';
-                    ed_draw(buf, len, cur, path);
-                }
-                continue;
-            }
+            /* Set status message */
+            int di = 0;
+            char num[16];
+            int v = (int)slen;
+            do { num[di++] = '0' + (v % 10); v /= 10; } while (v);
+            int mi = 0;
+            const char *prefix = "[ Wrote ";
+            while (*prefix) msg_buf[mi++] = *prefix++;
+            for (int k = di - 1; k >= 0; k--) msg_buf[mi++] = num[k];
+            const char *suffix = " bytes ]";
+            while (*suffix) msg_buf[mi++] = *suffix++;
+            msg_buf[mi] = '\0';
 
-            /* ---- Delete (sc 0x53, non-extended on some keyboards) ---- */
-            if (sc == 0x53)
-            {
-                if (cur < len)
-                {
-                    for (int i = cur; i < len - 1; i++) buf[i] = buf[i + 1];
-                    len--;
-                    buf[len] = '\0';
-                    ed_draw(buf, len, cur, path);
-                }
-                continue;
-            }
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+            continue;
+        }
 
-            /* ---- Enter ---- */
-            if (sc == 0x1C && len < ED_MAX - 1)
-            {
-                for (int i = len; i > cur; i--) buf[i] = buf[i - 1];
-                buf[cur++] = '\n'; len++;
+        /* ---- Ctrl+K: Cut line ---- */
+        if (ctrl && sc == 0x25)
+        {
+            /* Find start and end of current line */
+            int ls = cur;
+            while (ls > 0 && buf[ls - 1] != '\n') ls--;
+            int le = cur;
+            while (le < len && buf[le] != '\n') le++;
+            if (le < len && buf[le] == '\n') le++;
+
+            int clen = le - ls;
+            if (clen > 0) {
+                int ci = 0;
+                for (int i = ls; i < le && ci < 510; i++) cut_buf[ci++] = buf[i];
+                cut_buf[ci] = '\0';
+
+                for (int i = ls; i < len - clen; i++) buf[i] = buf[i + clen];
+                len -= clen;
                 buf[len] = '\0';
-                ed_draw(buf, len, cur, path);
-                continue;
+                cur = ls;
+                modified = 1;
+                const char *kmsg = "[ Cut 1 line ]";
+                int mi = 0; while (*kmsg) msg_buf[mi++] = *kmsg++; msg_buf[mi] = '\0';
             }
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+            continue;
+        }
 
-            /* ---- Regular printable character ---- */
-            char c = ed_translate(sc, shift, caps);
-            if (c && c != '\b' && len < ED_MAX - 1)
-            {
-                for (int i = len; i > cur; i--) buf[i] = buf[i - 1];
-                buf[cur++] = c; len++;
+        /* ---- Ctrl+U: Paste line / buffer ---- */
+        if (ctrl && sc == 0x16)
+        {
+            int clen = 0;
+            while (cut_buf[clen]) clen++;
+            if (clen > 0 && len + clen < ED_MAX - 1) {
+                for (int i = len; i >= cur; i--) buf[i + clen] = buf[i];
+                for (int i = 0; i < clen; i++) buf[cur + i] = cut_buf[i];
+                len += clen;
+                cur += clen;
                 buf[len] = '\0';
-                ed_draw(buf, len, cur, path);
+                modified = 1;
             }
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+            continue;
+        }
+
+        /* ---- Backspace ---- */
+        if (sc == 0x0E)
+        {
+            if (cur > 0)
+            {
+                for (int i = cur - 1; i < len - 1; i++) buf[i] = buf[i + 1];
+                len--; cur--;
+                buf[len] = '\0';
+                modified = 1;
+                ed_draw(buf, len, cur, path, modified, msg_buf);
+            }
+            continue;
+        }
+
+        /* ---- Enter ---- */
+        if (sc == 0x1C && len < ED_MAX - 1)
+        {
+            for (int i = len; i > cur; i--) buf[i] = buf[i - 1];
+            buf[cur++] = '\n'; len++;
+            buf[len] = '\0';
+            modified = 1;
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+            continue;
+        }
+
+        /* ---- Regular printable character ---- */
+        char c = ed_translate(sc, shift, caps);
+        if (c && c != '\b' && len < ED_MAX - 1)
+        {
+            for (int i = len; i > cur; i--) buf[i] = buf[i - 1];
+            buf[cur++] = c; len++;
+            buf[len] = '\0';
+            modified = 1;
+            ed_draw(buf, len, cur, path, modified, msg_buf);
+        }
     }
 
-    /* restore shell */
+    /* Restore VGA text mode & clear */
     vga_clear();
-    /* Return to vga_prompt() which is already on the call stack —
-     * do NOT call vga_prompt() here or it creates an infinite recursive loop. */
 }
+
 

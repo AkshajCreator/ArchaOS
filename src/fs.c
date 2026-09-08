@@ -49,7 +49,9 @@ static void fs_memset(void *dst, uint8_t val, size_t n)
 /* Append src to dst, dst has bufsz total capacity */
 static void fs_strcat(char *dst, const char *src, size_t bufsz)
 {
+    if (!dst || !src || bufsz == 0) return;
     int dlen = fs_strlen(dst);
+    if ((size_t)dlen >= bufsz) { dst[bufsz - 1] = '\0'; return; }
     int i = 0;
     while (src[i] && (size_t)(dlen + i + 1) < bufsz)
     {
@@ -106,6 +108,8 @@ static fs_node_t *cwd_node  = 0;
  * FS_INIT
  * ============================================================ */
 
+static void fs_init_default_files(void);
+
 void fs_init(void)
 {
     fs_memset(node_pool, 0, sizeof(node_pool));
@@ -118,6 +122,8 @@ void fs_init(void)
     root_node->parent = root_node;  /* root's parent is itself */
 
     cwd_node = root_node;
+
+    fs_init_default_files();
 }
 
 /* ============================================================
@@ -129,10 +135,11 @@ fs_node_t *fs_cwd(void)  { return cwd_node;  }
 
 void fs_pwd(char *buf, size_t bufsz)
 {
+    if (!buf || bufsz == 0) return;
     /* Build path by walking up to root */
     fs_node_t *cur = cwd_node;
 
-    if (cur == root_node) { fs_strcpy(buf, "/"); return; }
+    if (!cur || cur == root_node) { fs_strncpy(buf, "/", bufsz); return; }
 
     /* Collect path segments */
     char segments[16][FS_MAX_NAME];
@@ -213,6 +220,7 @@ fs_node_t *fs_resolve(const char *path)
         int  j = 0;
         while (tmp[i] && tmp[i] != '/' && j < FS_MAX_NAME - 1)
             comp[j++] = tmp[i++];
+        while (tmp[i] && tmp[i] != '/') i++; /* Skip remaining chars of oversized component */
         comp[j] = '\0';
         if (tmp[i] == '/') i++;
 
@@ -235,6 +243,7 @@ fs_node_t *fs_resolve(const char *path)
 /* Split a path into parent dir + final component name */
 static fs_node_t *resolve_parent(const char *path, char *name_out)
 {
+    if (!path || !name_out) return 0;
     char tmp[FS_MAX_PATH];
     fs_strncpy(tmp, path, FS_MAX_PATH);
 
@@ -286,15 +295,19 @@ fs_node_t *fs_mkdir(const char *path)
 {
     char name[FS_MAX_NAME];
     fs_node_t *parent = resolve_parent(path, name);
-    if (!parent || !name[0]) return 0;
+    if (!parent || !name[0] || parent->type != FS_DIR) return 0;
     if (find_child(parent, name)) return 0;  /* already exists */
+    if (parent->child_count >= FS_MAX_CHILDREN) return 0;
 
-        fs_node_t *n = node_alloc();
+    fs_node_t *n = node_alloc();
     if (!n) return 0;
 
     fs_strncpy(n->name, name, FS_MAX_NAME);
     n->type = FS_DIR;
-    add_child(parent, n);
+    if (add_child(parent, n) < 0) {
+        node_free(n);
+        return 0;
+    }
     return n;
 }
 
@@ -306,11 +319,12 @@ fs_node_t *fs_touch(const char *path)
 {
     char name[FS_MAX_NAME];
     fs_node_t *parent = resolve_parent(path, name);
-    if (!parent || !name[0]) return 0;
+    if (!parent || !name[0] || parent->type != FS_DIR) return 0;
 
     /* Return existing file */
     fs_node_t *ex = find_child(parent, name);
-    if (ex) return ex;
+    if (ex) return (ex->type == FS_FILE) ? ex : 0;
+    if (parent->child_count >= FS_MAX_CHILDREN) return 0;
 
     fs_node_t *n = node_alloc();
     if (!n) return 0;
@@ -319,7 +333,10 @@ fs_node_t *fs_touch(const char *path)
     n->type = FS_FILE;
     n->data = 0;
     n->size = 0;
-    add_child(parent, n);
+    if (add_child(parent, n) < 0) {
+        node_free(n);
+        return 0;
+    }
     return n;
 }
 
@@ -333,10 +350,12 @@ int fs_write(const char *path, const char *data, size_t len)
     if (!n) n = fs_touch(path);
     if (!n || n->type != FS_FILE) return -1;
 
-    if (n->data) kfree(n->data);
+    if (n->data) { kfree(n->data); n->data = 0; n->size = 0; }
+
+    if (len == 0) return 0;
 
     n->data = kmalloc(len + 1);
-    if (!n->data) return -1;
+    if (!n->data) { n->size = 0; return -1; }
 
     fs_memcpy(n->data, data, len);
     n->data[len] = '\0';
@@ -350,11 +369,12 @@ int fs_write(const char *path, const char *data, size_t len)
 
 int fs_cat(const char *path, char *buf, size_t bufsz)
 {
+    if (!buf || bufsz == 0) return -1;
     fs_node_t *n = fs_resolve(path);
     if (!n || n->type != FS_FILE) return -1;
 
     size_t copy = (n->size < bufsz - 1) ? n->size : bufsz - 1;
-    if (n->data) fs_memcpy(buf, n->data, copy);
+    if (n->data && copy > 0) fs_memcpy(buf, n->data, copy);
     buf[copy] = '\0';
     return 0;
 }
@@ -395,8 +415,11 @@ int fs_cp(const char *src, const char *dst)
     fs_node_t *s = fs_resolve(src);
     if (!s || s->type != FS_FILE) return -1;
 
-    fs_node_t *d = fs_touch(dst);
-    if (!d) return -1;
+    fs_node_t *d = fs_resolve(dst);
+    if (d == s) return 0; /* Self-copy is a no-op */
+
+    if (!d) d = fs_touch(dst);
+    if (!d || d->type != FS_FILE) return -1;
 
     if (d->data) { kfree(d->data); d->data = 0; d->size = 0; }
 
@@ -424,7 +447,19 @@ int fs_mv(const char *src, const char *dst)
     /* Resolve new parent and name */
     char new_name[FS_MAX_NAME];
     fs_node_t *new_parent = resolve_parent(dst, new_name);
-    if (!new_parent || !new_name[0]) return -1;
+    if (!new_parent || !new_name[0] || new_parent->type != FS_DIR) return -1;
+
+    /* Prevent moving a directory inside itself or its descendants */
+    if (s->type == FS_DIR) {
+        fs_node_t *chk = new_parent;
+        while (chk && chk != root_node) {
+            if (chk == s) return -1;
+            chk = chk->parent;
+        }
+    }
+
+    /* Check destination capacity */
+    if (new_parent != s->parent && new_parent->child_count >= FS_MAX_CHILDREN) return -1;
 
     /* Detach from old parent, attach to new */
     remove_child(s->parent, s);
@@ -439,10 +474,11 @@ int fs_mv(const char *src, const char *dst)
 
 void fs_ls(const char *path, char *buf, size_t bufsz)
 {
+    if (!buf || bufsz == 0) return;
     fs_node_t *dir = path ? fs_resolve(path) : cwd_node;
     if (!dir || dir->type != FS_DIR)
     {
-        fs_strcpy(buf, "not a directory\n");
+        fs_strncpy(buf, "not a directory\n", bufsz);
         return;
     }
 
@@ -450,7 +486,7 @@ void fs_ls(const char *path, char *buf, size_t bufsz)
 
     if (dir->child_count == 0)
     {
-        fs_strcpy(buf, "(empty)\n");
+        fs_strncpy(buf, "(empty)\n", bufsz);
         return;
     }
 
@@ -461,4 +497,96 @@ void fs_ls(const char *path, char *buf, size_t bufsz)
         fs_strcat(buf, c->name, bufsz);
         fs_strcat(buf, "\n", bufsz);
     }
+}
+
+/* ============================================================
+ * DEFAULT SYSTEM & USER DOCUMENTATION FILES
+ * ============================================================ */
+
+static void fs_init_default_files(void)
+{
+    static const char NEW_CONTENT[] =
+        "=== WHAT'S NEW IN ARCHAOS v0.5 ===\n\n"
+        "1. ADVANCED CLI SHELL & TERMINAL ENGINE\n"
+        "   - Fish-style inline autosuggestions: lookahead in dim gray;\n"
+        "     press Right Arrow or Tab to accept.\n"
+        "   - Reverse Incremental History Search (Ctrl+R): interactive\n"
+        "     history query with cycling, Enter to run, Tab/Right to edit,\n"
+        "     ESC to cancel.\n"
+        "   - Line editing shortcuts: Ctrl+L (clear screen), Ctrl+C (cancel),\n"
+        "     Ctrl+U (erase line before cursor).\n"
+        "   - Full ANSI escape sequence engine: SGR colors (fg/bg 30-37,\n"
+        "     90-97, 40-47, 100-107), bold, dim, inverse, cursor movements,\n"
+        "     erase line/display, tab stops. Test with 'ansi' or 'echo -e'.\n"
+        "   - Intelligent ANSI-aware word wrap: words wrap cleanly at space\n"
+        "     boundaries in terminal output and interactive prompt.\n\n"
+        "2. AUTHENTIC GNU NANO 0.5.0 MICRO-EDITOR\n"
+        "   - Full interactive terminal text editor ('nano <f>' or 'edit <f>').\n"
+        "   - Inverted title header, 21-line text canvas with word wrap,\n"
+        "     status bar, and two-row shortcut legend (^O WriteOut, ^K Cut,\n"
+        "     ^U UnCut, ^X Exit).\n\n"
+        "3. UNIVERSAL UNIX PIPELINES & SCRIPTING\n"
+        "   - Inter-process communication via in-memory buffer: 'cmd1 | cmd2'.\n"
+        "   - Semicolon command sequencing: 'cmd1; cmd2'.\n"
+        "   - Environment variables: export VAR=val, env, unset VAR, $VAR.\n\n"
+        "4. MODE 13h MODERN DESKTOP & IN-BROWSER MEDIA\n"
+        "   - Multi-tier window drop shadows with active window cyan glow.\n"
+        "   - Window split-screen edge snapping (left/right/top) and\n"
+        "     maximize (Alt+Enter).\n"
+        "   - Desktop file icons with MIME associations (.txt, .wav, .vid, .py).\n"
+        "   - Consolidated in-browser universal media player with scrubber.\n"
+        "   - Speed dial bookmarks bar and Ctrl+Tab browser tab cycling.\n"
+        "   - PIT interrupt-driven background audio synthesizer (100 Hz).\n\n"
+        "5. MODERN NETWORKING TOOLS\n"
+        "   - 'wget <url> [-O file]': download web assets directly into VFS.\n"
+        "   - 'curl <url>', 'ping <host>', 'ifconfig'.\n\n"
+        "Type \"general\" to read the complete system manual.\n";
+
+    static const char GENERAL_CONTENT[] =
+        "=== ARCHAOS OPERATING SYSTEM — USER MANUAL & ARCHITECTURE ===\n\n"
+        "OVERVIEW:\n"
+        "ArchaOS is an advanced, lightweight 32-bit x86 monolithic OS\n"
+        "running in Protected Mode (Ring 0) with a Virtual Memory Manager,\n"
+        "VFS RAM disk, Mode 13h desktop compositor, and integrated AI.\n"
+        "It is 100% in-memory and ephemeral (zero persistent disk footprint).\n\n"
+        "SHELL COMMANDS:\n"
+        "- System:       help, new, general, clear/cls, reboot, halt,\n"
+        "                uptime, date, top, neofetch, fortune, theme <name>,\n"
+        "                matrix, credits, meminfo, memtest\n"
+        "- Filesystem:   ls, tree, cd, pwd, mkdir, touch, cat, less, nano,\n"
+        "                head, tail, stat, hexdump, write, rm, cp, mv, wc,\n"
+        "                grep, find\n"
+        "- Networking:   ifconfig, ping <host>, curl <url>, wget <url>,\n"
+        "                ports\n"
+        "- Shell & Env:  export VAR=val, env, unset VAR, $VAR, cmd1; cmd2,\n"
+        "                pipes |, Ctrl+R (history search), ansi / colors\n"
+        "- AI Assistant: ai <question> (multi-turn chat), ai clear, ai history\n"
+        "- Multimedia:   audio [play|stop|pause|next|prev|list], video, beep\n"
+        "- Hardware:     pci [list|scan], serial [com1|com2], ata\n"
+        "- Graphical:    gui (enters Mode 13h desktop environment)\n\n"
+        "KEYBOARD SHORTCUTS:\n"
+        "- Shell:        Tab / Right Arrow: accept inline suggestion\n"
+        "                Ctrl+R: reverse history search | Ctrl+L: clear screen\n"
+        "                Ctrl+C: cancel current line    | Ctrl+U: erase line\n"
+        "- Nano:         Ctrl+O: save file              | Ctrl+X: exit editor\n"
+        "                Ctrl+K: cut line               | Ctrl+U: uncut / paste\n"
+        "- GUI Desktop:  Alt+Enter / F11: maximize      | Ctrl+W / Alt+F4: close\n"
+        "                Ctrl+Tab: cycle browser tabs   | Ctrl++ / Ctrl+-: volume\n"
+        "                ESC: return to CLI shell\n\n"
+        "GRAPHICAL DESKTOP APPLICATIONS:\n"
+        "- Web Browser:  NetSurf engine + JS runtime + NanoSVG vector decoder\n"
+        "                Docked universal media player & Speed Dial bookmarks\n"
+        "- Terminal:     Mode 13h terminal window with command capture\n"
+        "- App Studio:   Integrated code editor and C/Python script runner\n"
+        "- Utilities:    File Manager, Notepad, Painter, Calculator, Snake,\n"
+        "                Minesweeper, Control Panel, Task Manager, Image Viewer\n";
+
+    fs_write("/new", NEW_CONTENT, sizeof(NEW_CONTENT) - 1);
+    fs_write("/general", GENERAL_CONTENT, sizeof(GENERAL_CONTENT) - 1);
+
+    fs_mkdir("/sys");
+    fs_write("/sys/ai_chat.log", "", 0);
+
+    fs_mkdir("/audio");
+    fs_mkdir("/media");
 }

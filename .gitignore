@@ -3,12 +3,20 @@ build/
 *.o
 *.bin
 *.iso
+*.img
+disk.img
 
 # Editor junk
 *.swp
 *.swo
 .vscode/
 .idea/
+scratch/
+MicroPython.txt
+*.ppm
 
 # OS junk
 .DS_Store
+
+# Temporary / Scratch
+my-app/

@@ -5,10 +5,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define FS_MAX_NODES     64
+#define FS_MAX_NODES     128
 #define FS_MAX_NAME      32
 #define FS_MAX_PATH     256
-#define FS_MAX_CHILDREN  16   /* max entries per directory */
+#define FS_MAX_CHILDREN  24   /* max entries per directory */
 
 typedef enum {
     FS_FILE = 1,

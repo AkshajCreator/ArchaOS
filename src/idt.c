@@ -57,19 +57,47 @@ extern void _isr12(void); extern void _isr13(void);
 extern void _isr14(void); extern void _isr15(void);
 extern void _isr16(void); extern void _isr17(void);
 extern void _isr18(void); extern void _isr19(void);
-extern void _irq0(void);
-extern void _irq1(void);
-extern void _irq8(void);
-extern void _irq12(void);
+extern void _irq0(void);  extern void _irq1(void);
+extern void _irq2(void);  extern void _irq3(void);
+extern void _irq4(void);  extern void _irq5(void);
+extern void _irq6(void);  extern void _irq7(void);
+extern void _irq8(void);  extern void _irq9(void);
+extern void _irq10(void); extern void _irq11(void);
+extern void _irq12(void); extern void _irq13(void);
+extern void _irq14(void); extern void _irq15(void);
+
+#include "serial.h"
+
+/* ============================================================
+ * SSE / FPU INITIALIZATION
+ * ============================================================ */
+
+void sse_init(void)
+{
+    uint32_t cr0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1 << 2); /* Clear EM (Emulation) */
+    cr0 |= (1 << 1);  /* Set MP (Monitor Coprocessor) */
+    asm volatile("mov %0, %%cr0" :: "r"(cr0));
+
+    uint32_t cr4;
+    asm volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1 << 9);  /* Set OSFXSR (FXSAVE/FXRSTOR & SSE Support) */
+    cr4 |= (1 << 10); /* Set OSXMMEXCPT (Unmasked SIMD Exception Support) */
+    asm volatile("mov %0, %%cr4" :: "r"(cr4));
+
+    asm volatile("fninit");
+    serial_puts(COM1_BASE, "[CPU] FPU / SSE / AES-NI extensions enabled (CR4.OSFXSR=1)\n");
+}
 
 /* ============================================================
  * C-SIDE HANDLERS — called from isr_stubs.asm
  * ============================================================ */
 
-void isr_handler(uint32_t num)
+void isr_handler(uint32_t num, uint32_t err_code, uint32_t eip)
 {
-    (void)num;
-    for (;;) asm volatile("hlt");
+    serial_printf(COM1_BASE, "\n[CPU EXCEPTION] ISR %u (err=0x%x) at EIP=0x%x! Halting.\n", num, err_code, eip);
+    for (;;) asm volatile("cli; hlt");
 }
 
 void irq1_handler(void)
@@ -87,14 +115,26 @@ void irq8_handler(void)
     outb(0x20, 0x20);
 }
 
+void default_irq_handler(int irq)
+{
+    if (irq >= 8) outb(0xA0, 0x20);
+    outb(0x20, 0x20);
+}
+
 static uint8_t mouse_cycle = 0;
 static uint8_t mouse_packet[3];
 
-void irq12_handler(void)
+/* ============================================================
+ * mouse_poll_hw — parse any pending PS/2 mouse bytes.
+ * Does NOT send PIC EOI — safe to call cooperatively from the
+ * GUI event loop without confusing the interrupt controller.
+ * ============================================================ */
+void mouse_poll_hw(void)
 {
-    uint8_t status = inb(0x64);
-    if ((status & 0x01) && (status & 0x20))
+    while (1)
     {
+        uint8_t status = inb(0x64);
+        if (!(status & 0x01) || !(status & 0x20)) break;
         uint8_t b = inb(0x60);
         switch (mouse_cycle)
         {
@@ -128,12 +168,17 @@ void irq12_handler(void)
                 break;
         }
     }
-
-    outb(0xA0, 0x20);
-    outb(0x20, 0x20);
 }
 
-static void mouse_wait(uint8_t type)
+/* ISR wrapper — called by hardware IRQ 12. Parses data then ACKs PIC. */
+void irq12_handler(void)
+{
+    mouse_poll_hw();
+    outb(0xA0, 0x20);  /* EOI to Slave PIC  */
+    outb(0x20, 0x20);  /* EOI to Master PIC */
+}
+
+static int mouse_wait(uint8_t type)
 {
     uint32_t timeout = 100000;
     if (type == 0) {
@@ -141,6 +186,7 @@ static void mouse_wait(uint8_t type)
     } else {
         while ((inb(0x64) & 2) && --timeout);
     }
+    return timeout > 0; /* 1 = success, 0 = timed out */
 }
 
 static void mouse_write(uint8_t write)
@@ -163,16 +209,32 @@ void mouse_init(void)
 {
     uint8_t status;
 
-    mouse_wait(1);
+    /* Disable interrupts during PS/2 hardware handshake so ACKs (0xFA)
+     * are read synchronously and not intercepted by irq12_handler */
+    asm volatile("cli");
+
+    /* Flush output buffer first */
+    while (inb(0x64) & 1) inb(0x60);
+
+    /* Pre-check: if PS/2 controller doesn't exist (common on pure UEFI
+     * laptops with I2C touchpads), the status register reads 0xFF.
+     * Bail out immediately to avoid hanging. */
+    status = inb(0x64);
+    if (status == 0xFF) {
+        asm volatile("sti");
+        return;
+    }
+
+    if (!mouse_wait(1)) { asm volatile("sti"); return; }
     outb(0x64, 0xA8);
 
-    mouse_wait(1);
+    if (!mouse_wait(1)) { asm volatile("sti"); return; }
     outb(0x64, 0x20);
-    mouse_wait(0);
-    status = (inb(0x60) | 2) & ~0x20;
-    mouse_wait(1);
+    if (!mouse_wait(0)) { asm volatile("sti"); return; }
+    status = (inb(0x60) | 0x03) & ~0x20;
+    if (!mouse_wait(1)) { asm volatile("sti"); return; }
     outb(0x64, 0x60);
-    mouse_wait(1);
+    if (!mouse_wait(1)) { asm volatile("sti"); return; }
     outb(0x60, status);
 
     mouse_write(0xF6);
@@ -181,7 +243,20 @@ void mouse_init(void)
     mouse_write(0xF4);
     mouse_read();
 
-    irq_unmask(12);
+    /* Flush any leftover response bytes */
+    while (inb(0x64) & 1) inb(0x60);
+
+    mouse_cycle = 0;
+    mouse_packet[0] = 0;
+    mouse_packet[1] = 0;
+    mouse_packet[2] = 0;
+    mouse_left_click = 0;
+    mouse_right_click = 0;
+
+    irq_unmask(2);  /* Unmask cascade on Master PIC */
+    irq_unmask(12); /* Unmask IRQ 12 on Slave PIC */
+
+    asm volatile("sti");
 }
 
 /* ============================================================
@@ -265,44 +340,64 @@ void idt_init(void)
     idt_ptr.base  = (uint32_t)&idt;
 
     /* 4. Exception stubs */
-    idt_set_gate(0,  (uint32_t)_isr0,  0x10, 0x8E);
-    idt_set_gate(1,  (uint32_t)_isr1,  0x10, 0x8E);
-    idt_set_gate(2,  (uint32_t)_isr2,  0x10, 0x8E);
-    idt_set_gate(3,  (uint32_t)_isr3,  0x10, 0x8E);
-    idt_set_gate(4,  (uint32_t)_isr4,  0x10, 0x8E);
-    idt_set_gate(5,  (uint32_t)_isr5,  0x10, 0x8E);
-    idt_set_gate(6,  (uint32_t)_isr6,  0x10, 0x8E);
-    idt_set_gate(7,  (uint32_t)_isr7,  0x10, 0x8E);
-    idt_set_gate(8,  (uint32_t)_isr8,  0x10, 0x8E);
-    idt_set_gate(9,  (uint32_t)_isr9,  0x10, 0x8E);
-    idt_set_gate(10, (uint32_t)_isr10, 0x10, 0x8E);
-    idt_set_gate(11, (uint32_t)_isr11, 0x10, 0x8E);
-    idt_set_gate(12, (uint32_t)_isr12, 0x10, 0x8E);
-    idt_set_gate(13, (uint32_t)_isr13, 0x10, 0x8E);
-    idt_set_gate(14, (uint32_t)_isr14, 0x10, 0x8E);
-    idt_set_gate(15, (uint32_t)_isr15, 0x10, 0x8E);
-    idt_set_gate(16, (uint32_t)_isr16, 0x10, 0x8E);
-    idt_set_gate(17, (uint32_t)_isr17, 0x10, 0x8E);
-    idt_set_gate(18, (uint32_t)_isr18, 0x10, 0x8E);
-    idt_set_gate(19, (uint32_t)_isr19, 0x10, 0x8E);
+    uint16_t cs_sel;
+    asm volatile("mov %%cs, %0" : "=r"(cs_sel));
 
-    /* 5. IRQ handlers */
-    idt_set_gate(32, (uint32_t)_irq0,  0x10, 0x8E);
-    idt_set_gate(33, (uint32_t)_irq1,  0x10, 0x8E);
-    idt_set_gate(40, (uint32_t)_irq8,  0x10, 0x8E);
-    idt_set_gate(44, (uint32_t)_irq12, 0x10, 0x8E);
+    idt_set_gate(0,  (uint32_t)_isr0,  cs_sel, 0x8E);
+    idt_set_gate(1,  (uint32_t)_isr1,  cs_sel, 0x8E);
+    idt_set_gate(2,  (uint32_t)_isr2,  cs_sel, 0x8E);
+    idt_set_gate(3,  (uint32_t)_isr3,  cs_sel, 0x8E);
+    idt_set_gate(4,  (uint32_t)_isr4,  cs_sel, 0x8E);
+    idt_set_gate(5,  (uint32_t)_isr5,  cs_sel, 0x8E);
+    idt_set_gate(6,  (uint32_t)_isr6,  cs_sel, 0x8E);
+    idt_set_gate(7,  (uint32_t)_isr7,  cs_sel, 0x8E);
+    idt_set_gate(8,  (uint32_t)_isr8,  cs_sel, 0x8E);
+    idt_set_gate(9,  (uint32_t)_isr9,  cs_sel, 0x8E);
+    idt_set_gate(10, (uint32_t)_isr10, cs_sel, 0x8E);
+    idt_set_gate(11, (uint32_t)_isr11, cs_sel, 0x8E);
+    idt_set_gate(12, (uint32_t)_isr12, cs_sel, 0x8E);
+    idt_set_gate(13, (uint32_t)_isr13, cs_sel, 0x8E);
+    idt_set_gate(14, (uint32_t)_isr14, cs_sel, 0x8E);
+    idt_set_gate(15, (uint32_t)_isr15, cs_sel, 0x8E);
+    idt_set_gate(16, (uint32_t)_isr16, cs_sel, 0x8E);
+    idt_set_gate(17, (uint32_t)_isr17, cs_sel, 0x8E);
+    idt_set_gate(18, (uint32_t)_isr18, cs_sel, 0x8E);
+    idt_set_gate(19, (uint32_t)_isr19, cs_sel, 0x8E);
+
+    /* 5. IRQ handlers (all 16 PIC IRQs mapped to vectors 32..47) */
+    idt_set_gate(32, (uint32_t)_irq0,  cs_sel, 0x8E);
+    idt_set_gate(33, (uint32_t)_irq1,  cs_sel, 0x8E);
+    idt_set_gate(34, (uint32_t)_irq2,  cs_sel, 0x8E);
+    idt_set_gate(35, (uint32_t)_irq3,  cs_sel, 0x8E);
+    idt_set_gate(36, (uint32_t)_irq4,  cs_sel, 0x8E);
+    idt_set_gate(37, (uint32_t)_irq5,  cs_sel, 0x8E);
+    idt_set_gate(38, (uint32_t)_irq6,  cs_sel, 0x8E);
+    idt_set_gate(39, (uint32_t)_irq7,  cs_sel, 0x8E);
+    idt_set_gate(40, (uint32_t)_irq8,  cs_sel, 0x8E);
+    idt_set_gate(41, (uint32_t)_irq9,  cs_sel, 0x8E);
+    idt_set_gate(42, (uint32_t)_irq10, cs_sel, 0x8E);
+    idt_set_gate(43, (uint32_t)_irq11, cs_sel, 0x8E);
+    idt_set_gate(44, (uint32_t)_irq12, cs_sel, 0x8E);
+    idt_set_gate(45, (uint32_t)_irq13, cs_sel, 0x8E);
+    idt_set_gate(46, (uint32_t)_irq14, cs_sel, 0x8E);
+    idt_set_gate(47, (uint32_t)_irq15, cs_sel, 0x8E);
 
     /* 6. Load IDT */
     asm volatile("lidt %0" : : "m"(idt_ptr));
 
-    /* 7. Init RTC */
+    /* 7. Init RTC & Mouse */
     rtc_init();
+    mouse_init();
 
-    /* 8. Unmask PIT, keyboard, cascade, RTC */
+    /* 8. Unmask PIT, keyboard, cascade, RTC, Mouse */
     irq_unmask(0);
     irq_unmask(1);
     irq_unmask(2);
     irq_unmask(8);
+    irq_unmask(12);
+
+    /* 8.5. Enable FPU & SSE/AES-NI */
+    sse_init();
 
     /* 9. Enable interrupts — always last */
     asm volatile("sti");

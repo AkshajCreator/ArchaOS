@@ -69,7 +69,7 @@ void mm_init(uint32_t detected_ram_bytes)
     if (want < HEAP_MIN) want = HEAP_MIN;
     if (want > HEAP_MAX) want = HEAP_MAX;
 
-    heap_size = want;
+    heap_size = want & ~(size_t)(ALIGN - 1);
 
     heap_head       = (block_t *)heap;
     heap_head->size = heap_size - HEADER_SIZE;
@@ -121,7 +121,7 @@ static void coalesce(void)
 
 void *kmalloc(size_t size)
 {
-    if (!mm_ready || size == 0) return 0;
+    if (!mm_ready || size == 0 || size > (HEAP_MAX - HEADER_SIZE)) return 0;
 
     size = align_up(size);
     block_t *cur = heap_head;
@@ -139,12 +139,35 @@ void *kmalloc(size_t size)
     return 0;
 }
 
+void *krealloc(void *ptr, size_t new_size)
+{
+    if (!ptr) return kmalloc(new_size);
+    if (new_size == 0) { kfree(ptr); return 0; }
+    if (!mm_ready) return 0;
+    if ((uint8_t *)ptr < heap + HEADER_SIZE || (uint8_t *)ptr >= heap + heap_size) return 0;
+
+    block_t *blk = (block_t *)((uint8_t *)ptr - HEADER_SIZE);
+    size_t old_size = blk->size;
+    if (new_size <= old_size) return ptr;
+
+    void *new_ptr = kmalloc(new_size);
+    if (!new_ptr) return 0;
+
+    uint8_t *s = (uint8_t *)ptr;
+    uint8_t *d = (uint8_t *)new_ptr;
+    for (size_t i = 0; i < old_size; i++) d[i] = s[i];
+
+    kfree(ptr);
+    return new_ptr;
+}
+
 void kfree(void *ptr)
 {
     if (!ptr || !mm_ready) return;
-    if ((uint8_t *)ptr < heap || (uint8_t *)ptr >= heap + heap_size) return;
+    if ((uint8_t *)ptr < heap + HEADER_SIZE || (uint8_t *)ptr >= heap + heap_size) return;
 
     block_t *blk = (block_t *)((uint8_t *)ptr - HEADER_SIZE);
+    if (blk->free) return;
     blk->free = 1;
     coalesce();
 }

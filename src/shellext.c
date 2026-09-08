@@ -10,6 +10,7 @@
 #include "kernel.h"
 #include "vga.h"
 #include "fs.h"
+#include "serial.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -20,8 +21,11 @@
 static int se_strlen(const char *s)
 { int n=0; while(s[n]) n++; return n; }
 
-static void se_strcpy(char *d, const char *s)
+static __attribute__((unused)) void se_strcpy(char *d, const char *s)
 { while((*d++=*s++)); }
+
+static void se_strncpy(char *d, const char *s, int n)
+{ int i = 0; while (i < n - 1 && s[i]) { d[i] = s[i]; i++; } d[i] = '\0'; }
 
 /* se_strcat removed as unused */
 
@@ -49,17 +53,27 @@ void shellext_capture_char(char c)
     if (cap_len < CAP_SIZE - 1) cap_buf[cap_len++] = c;
 }
 
-static void capture_start(void)
+void shellext_capture_start(void)
 {
     cap_len   = 0;
     cap_buf[0]= '\0';
     capturing = 1;
 }
 
-static void capture_stop(void)
+void shellext_capture_stop(void)
 {
     capturing   = 0;
     cap_buf[cap_len] = '\0';
+}
+
+int shellext_is_capturing(void)
+{
+    return capturing;
+}
+
+const char *shellext_get_captured(void)
+{
+    return cap_buf;
 }
 
 /* ============================================================
@@ -134,6 +148,123 @@ static const char *alias_expand(const char *cmd)
 }
 
 /* ============================================================
+ * ENVIRONMENT VARIABLES
+ * ============================================================ */
+
+#define MAX_ENV_VARS  32
+#define ENV_NAMELEN   24
+#define ENV_VALLEN    64
+
+typedef struct {
+    char name[ENV_NAMELEN];
+    char val[ENV_VALLEN];
+} env_t;
+
+static env_t env_vars[MAX_ENV_VARS];
+static int   env_count = 0;
+static int   env_initialized = 0;
+
+void env_init(void)
+{
+    if (env_initialized) return;
+    env_initialized = 1;
+    env_count = 0;
+
+    env_set("USER", "root");
+    env_set("OS", "ArchaOS");
+    env_set("SHELL", "vga_shell");
+    env_set("TERM", "vga-80x25");
+    env_set("ARCH", "i386");
+    env_set("HOME", "/");
+}
+
+void env_set(const char *name, const char *value)
+{
+    if (!env_initialized) env_init();
+
+    /* Update existing */
+    for (int i = 0; i < env_count; i++) {
+        if (se_strcmp(env_vars[i].name, name) == 0) {
+            int vl = se_strlen(value);
+            if (vl >= ENV_VALLEN) vl = ENV_VALLEN - 1;
+            int j; for (j = 0; j < vl; j++) env_vars[i].val[j] = value[j];
+            env_vars[i].val[j] = '\0';
+            return;
+        }
+    }
+    if (env_count >= MAX_ENV_VARS) { vga_print("export: environment table full\n"); return; }
+    int nl = se_strlen(name); if (nl >= ENV_NAMELEN) nl = ENV_NAMELEN - 1;
+    int vl = se_strlen(value); if (vl >= ENV_VALLEN) vl = ENV_VALLEN - 1;
+    int i; for (i = 0; i < nl; i++) env_vars[env_count].name[i] = name[i];
+    env_vars[env_count].name[i] = '\0';
+    for (i = 0; i < vl; i++) env_vars[env_count].val[i] = value[i];
+    env_vars[env_count].val[i] = '\0';
+    env_count++;
+}
+
+const char *env_get(const char *name)
+{
+    if (!env_initialized) env_init();
+    for (int i = 0; i < env_count; i++) {
+        if (se_strcmp(env_vars[i].name, name) == 0) {
+            return env_vars[i].val;
+        }
+    }
+    return 0;
+}
+
+void env_unset(const char *name)
+{
+    if (!env_initialized) env_init();
+    for (int i = 0; i < env_count; i++) {
+        if (se_strcmp(env_vars[i].name, name) == 0) {
+            for (int j = i; j < env_count - 1; j++) env_vars[j] = env_vars[j + 1];
+            env_count--;
+            return;
+        }
+    }
+}
+
+void env_list(void)
+{
+    if (!env_initialized) env_init();
+    for (int i = 0; i < env_count; i++) {
+        vga_print_color(env_vars[i].name, 0x0B);
+        vga_print("=");
+        vga_print(env_vars[i].val);
+        vga_print("\n");
+    }
+}
+
+static void env_expand_str(const char *in, char *out, int out_sz)
+{
+    if (!env_initialized) env_init();
+    int oi = 0;
+    for (int i = 0; in[i] && oi < out_sz - 1; i++) {
+        if (in[i] == '$' && ((in[i+1] >= 'A' && in[i+1] <= 'Z') || (in[i+1] >= 'a' && in[i+1] <= 'z') || in[i+1] == '_')) {
+            i++;
+            char varname[ENV_NAMELEN];
+            int vi = 0;
+            while (in[i] && ((in[i] >= 'A' && in[i] <= 'Z') || (in[i] >= 'a' && in[i] <= 'z') || (in[i] >= '0' && in[i] <= '9') || in[i] == '_') && vi < ENV_NAMELEN - 1) {
+                varname[vi++] = in[i++];
+            }
+            varname[vi] = '\0';
+            i--; /* Backtrack since loop increments */
+
+            const char *val = env_get(varname);
+            if (val) {
+                while (*val && oi < out_sz - 1) {
+                    out[oi++] = *val++;
+                }
+            }
+        } else {
+            out[oi++] = in[i];
+        }
+    }
+    out[oi] = '\0';
+}
+
+/* ============================================================
  * wc COMMAND
  * ============================================================ */
 
@@ -151,7 +282,7 @@ static void cmd_wc(const char *path)
         if (buf[i]==' '||buf[i]=='\n'||buf[i]=='\t') in_word=0;
         else if (!in_word) { in_word=1; words++; }
     }
-    char tmp[8];
+    char tmp[16];
     vga_print("  lines: "); itoa(lines, tmp, 10); vga_print(tmp);
     vga_print("  words: "); itoa(words, tmp, 10); vga_print(tmp);
     vga_print("  chars: "); itoa(chars, tmp, 10); vga_print(tmp);
@@ -209,7 +340,10 @@ void script_run(const char *path)
     int i=0;
     while (buf[i]) {
         char line[128]; int li=0;
-        while (buf[i]&&buf[i]!='\n'&&li<127) line[li++]=buf[i++];
+        while (buf[i] && buf[i] != '\n') {
+            if (li < 127) line[li++] = buf[i];
+            i++;
+        }
         line[li]='\0';
         if (buf[i]=='\n') i++;
         if (li==0||line[0]=='#') continue;  /* skip empty/comment lines */
@@ -230,9 +364,9 @@ static char redir_combined[CAP_SIZE * 2];
 
 static void exec_with_redirect(const char *cmd, const char *file, int append)
 {
-    capture_start();
-    kernel_execute_command(cmd);
-    capture_stop();
+    shellext_capture_start();
+    shell_exec(cmd);
+    shellext_capture_stop();
 
     if (append) {
         /* Read existing content */
@@ -264,28 +398,49 @@ static void exec_pipe(const char *left, const char *right)
     /* Capture left side output into a temp file */
     static const char *TMPFILE = "/tmp_pipe";
 
-    capture_start();
-    kernel_execute_command(left);
-    capture_stop();
+    shellext_capture_start();
+    shell_exec(left);
+    shellext_capture_stop();
 
     /* Write captured output to temp file */
     fs_write(TMPFILE, cap_buf, (size_t)cap_len);
 
     /* Build right-side command with temp file */
     char right_cmd[128];
-    se_strcpy(right_cmd, right);
+    se_strncpy(right_cmd, right, sizeof(right_cmd));
 
     /* Trim leading spaces */
-    int r=0; while(right_cmd[r]==' ') r++;
+    int r = 0; while (right_cmd[r] == ' ') r++;
     const char *rcmd = right_cmd + r;
 
-    /* Handle known pipe consumers */
-    if (se_strncmp(rcmd, "grep ", 5)==0) {
-        cmd_grep(rcmd+5, TMPFILE);
-    } else if (se_strcmp(rcmd, "wc")==0) {
+    /* Handle pipe consumers */
+    extern void cmd_less(const char *path);
+    if (se_strncmp(rcmd, "grep ", 5) == 0) {
+        cmd_grep(rcmd + 5, TMPFILE);
+    } else if (se_strcmp(rcmd, "wc") == 0) {
         cmd_wc(TMPFILE);
+    } else if (se_strcmp(rcmd, "less") == 0 || se_strcmp(rcmd, "more") == 0) {
+        cmd_less(TMPFILE);
+    } else if (se_strncmp(rcmd, "less ", 5) == 0 || se_strncmp(rcmd, "more ", 5) == 0) {
+        shell_exec(rcmd);
     } else {
-        vga_print("pipe: right side must be grep or wc\n");
+        /* General command consumer: append TMPFILE if right command has no arguments */
+        char full_right[160];
+        int ri = 0;
+        while (rcmd[ri] && ri < 120) { full_right[ri] = rcmd[ri]; ri++; }
+        int has_space = 0;
+        for (int i = 0; i < ri; i++) {
+            if (full_right[i] == ' ') { has_space = 1; break; }
+        }
+        if (!has_space) {
+            full_right[ri++] = ' ';
+            const char *t = TMPFILE;
+            while (*t && ri < 159) full_right[ri++] = *t++;
+            full_right[ri] = '\0';
+            shell_exec(full_right);
+        } else {
+            shell_exec(rcmd);
+        }
     }
 
     fs_rm(TMPFILE);
@@ -308,9 +463,72 @@ static void shell_exec_internal(const char *raw)
     while (*raw==' ') raw++;
     if (!*raw) return;
 
+    /* ── Semicolon command separator ';' ── */
+    int semi_pos = -1;
+    int in_q = 0;
+    for (int i = 0; raw[i]; i++) {
+        if (raw[i] == '"' || raw[i] == '\'') in_q = !in_q;
+        else if (raw[i] == ';' && !in_q) { semi_pos = i; break; }
+    }
+    if (semi_pos >= 0) {
+        char first[128], second[128];
+        int fi = 0;
+        for (int i = 0; i < semi_pos && fi < 127; i++) first[fi++] = raw[i];
+        while (fi > 0 && first[fi - 1] == ' ') fi--;
+        first[fi] = '\0';
+
+        int si = 0;
+        const char *s = raw + semi_pos + 1;
+        while (*s == ' ') s++;
+        while (*s && si < 127) second[si++] = *s++;
+        second[si] = '\0';
+
+        if (first[0]) shell_exec(first);
+        if (second[0]) shell_exec(second);
+        return;
+    }
+
+    /* Expand environment variables $VAR */
+    char env_expanded[256];
+    env_expand_str(raw, env_expanded, sizeof(env_expanded));
+
     /* Alias expansion */
-    const char *expanded = alias_expand(raw);
-    const char *cmd = expanded ? expanded : raw;
+    const char *expanded = alias_expand(env_expanded);
+    const char *cmd = expanded ? expanded : env_expanded;
+
+    /* ── export command ── */
+    if (se_strncmp(cmd, "export ", 7) == 0) {
+        const char *rest = cmd + 7;
+        while (*rest == ' ') rest++;
+        int ei = 0; while (rest[ei] && rest[ei] != '=') ei++;
+        if (!rest[ei]) {
+            vga_print("usage: export NAME=VALUE\n");
+            return;
+        }
+        char name[ENV_NAMELEN]; int ni = 0;
+        while (ni < ei && ni < ENV_NAMELEN - 1) { name[ni] = rest[ni]; ni++; }
+        name[ni] = '\0';
+        while (ni > 0 && name[ni - 1] == ' ') name[--ni] = '\0';
+        if (ni == 0) { vga_print("export: invalid variable name\n"); return; }
+        env_set(name, rest + ei + 1);
+        return;
+    }
+    if (se_strcmp(cmd, "export") == 0 || se_strcmp(cmd, "env") == 0) {
+        env_list();
+        return;
+    }
+
+    /* ── unset command ── */
+    if (se_strncmp(cmd, "unset ", 6) == 0) {
+        const char *name = cmd + 6;
+        while (*name == ' ') name++;
+        env_unset(name);
+        return;
+    }
+    if (se_strcmp(cmd, "unset") == 0) {
+        vga_print("usage: unset <NAME>\n");
+        return;
+    }
 
     /* ── alias command ── */
     if (se_strncmp(cmd, "alias ", 6)==0) {
@@ -322,6 +540,8 @@ static void shell_exec_internal(const char *raw)
         if (!rest[ei]) { vga_print("usage: alias name=value\n"); return; }
         char name[ALIAS_NAMELEN]; int ni=0;
         while(ni<ei&&ni<ALIAS_NAMELEN-1){name[ni]=rest[ni];ni++;} name[ni]='\0';
+        while (ni > 0 && name[ni-1] == ' ') name[--ni] = '\0';
+        if (ni == 0) { vga_print("alias: invalid alias name\n"); return; }
         alias_set(name, rest+ei+1);
         return;
     }
@@ -331,6 +551,7 @@ static void shell_exec_internal(const char *raw)
     /* ── unalias ── */
     if (se_strncmp(cmd, "unalias ", 8)==0) {
         const char *name=cmd+8;
+        while(*name==' ') name++;
         for(int i=0;i<alias_count;i++) {
             if(se_strcmp(aliases[i].name,name)==0) {
                 for(int j=i;j<alias_count-1;j++) aliases[j]=aliases[j+1];
@@ -412,6 +633,7 @@ static void shell_exec_internal(const char *raw)
         const char *f = cmd+redir_pos+(redir_append?2:1);
         while(*f==' ') f++;
         int fi=0; while(*f&&fi<FS_MAX_NAME-1) file[fi++]=*f++;
+        while(fi>0&&file[fi-1]==' ') fi--;
         file[fi]='\0';
         exec_with_redirect(left, file, redir_append);
         return;
@@ -430,4 +652,40 @@ void shell_exec(const char *raw)
     exec_depth++;
     shell_exec_internal(raw);
     exec_depth--;
+}
+
+/* ============================================================
+ * CLIPBOARD & SERIAL COM1 SYNC
+ * ============================================================ */
+static char clipboard_buf[2048] = "";
+static int  clipboard_len = 0;
+
+void clipboard_copy(const char *text) {
+    if (!text) return;
+    int i = 0;
+    while (text[i] && i < 2047) {
+        clipboard_buf[i] = text[i];
+        i++;
+    }
+    clipboard_buf[i] = '\0';
+    clipboard_len = i;
+    /* Stream out to Serial COM1 for host capture */
+    serial_puts(COM1_BASE, clipboard_buf);
+    serial_putc(COM1_BASE, '\n');
+}
+
+const char *clipboard_paste(void) {
+    return clipboard_buf;
+}
+
+void clipboard_check_serial_input(void) {
+    while (serial_data_ready(COM1_BASE)) {
+        char c = serial_try_getc(COM1_BASE);
+        if (c == 0) break;
+        if (c == '\r') c = '\n';
+        if (clipboard_len < 2047) {
+            clipboard_buf[clipboard_len++] = c;
+            clipboard_buf[clipboard_len] = '\0';
+        }
+    }
 }

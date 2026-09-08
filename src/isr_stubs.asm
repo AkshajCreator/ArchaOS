@@ -17,11 +17,15 @@ extern irq12_handler
 global _isr%1
 _isr%1:
     cli
+    push dword 0    ; dummy error code
     pusha
-    push dword %1
+    push dword [esp + 36] ; EIP
+    push dword [esp + 36] ; Error code
+    push dword %1         ; ISR num
     call isr_handler
-    add esp, 4
+    add esp, 12
     popa
+    add esp, 4
     iret
 %endmacro
 
@@ -35,7 +39,6 @@ _irq%1:
     pusha
     call %2
     popa
-    sti
     iret
 %endmacro
 
@@ -47,12 +50,14 @@ _irq%1:
 global _isr%1
 _isr%1:
     cli
-    add esp, 4      ; discard the hardware-pushed error code
     pusha
-    push dword %1
+    push dword [esp + 36] ; EIP
+    push dword [esp + 36] ; Error code
+    push dword %1         ; ISR num
     call isr_handler
-    add esp, 4
+    add esp, 12
     popa
+    add esp, 4            ; discard error code
     iret
 %endmacro
 
@@ -79,9 +84,37 @@ ISR_NOERR 18
 ISR_NOERR 19
 
 
-; IRQ handlers
+; Dedicated IRQ handlers
 IRQ_STUB 0,  irq0_handler   ; PIT      -> vector 32
 IRQ_STUB 1,  irq1_handler   ; keyboard -> vector 33
 IRQ_STUB 8,  irq8_handler   ; RTC      -> vector 40
 IRQ_STUB 12, irq12_handler  ; mouse    -> vector 44
+
+; Default IRQ handler macro for unhandled hardware IRQs (vectors 34-39, 41-43, 45-47)
+extern default_irq_handler
+%macro IRQ_DEF 1
+global _irq%1
+_irq%1:
+    cli
+    pusha
+    push dword %1
+    call default_irq_handler
+    add esp, 4
+    popa
+    iret
+%endmacro
+
+IRQ_DEF 2
+IRQ_DEF 3
+IRQ_DEF 4
+IRQ_DEF 5
+IRQ_DEF 6
+IRQ_DEF 7
+IRQ_DEF 9
+IRQ_DEF 10
+IRQ_DEF 11
+IRQ_DEF 13
+IRQ_DEF 14
+IRQ_DEF 15
+
 

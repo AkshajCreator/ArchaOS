@@ -20,13 +20,20 @@ static inline uint8_t inb(uint16_t port)
 
 volatile uint32_t pit_tick_count = 0;
 
-/* ============================================================
- * IRQ0 HANDLER — called from isr_stubs.asm
- * ============================================================ */
+extern void audio_step(uint32_t now_ticks);
+static volatile int in_audio_step = 0;
 
 void irq0_handler(void)
 {
     pit_tick_count++;
+
+    /* Background Audio Mixer Daemon: tick audio engine at 100 Hz (~every 10ms) */
+    if ((pit_tick_count % 10) == 0 && !in_audio_step) {
+        in_audio_step = 1;
+        audio_step(pit_tick_count);
+        in_audio_step = 0;
+    }
+
     outb(0x20, 0x20);   /* EOI to master PIC */
 }
 
@@ -55,9 +62,15 @@ void pit_init(void)
 
 void pit_sleep(uint32_t ms)
 {
-    uint32_t end = pit_tick_count + ms;
-    while (pit_tick_count < end)
-        asm volatile("sti; hlt");
+    uint32_t start = pit_tick_count;
+    uint32_t end = start + ms;
+    uint32_t safety_cycles = ms * 50000;
+
+    /* If ticks advance, use them; if IRQ0 is masked by UEFI, fall back to cycle count */
+    while (pit_tick_count < end && safety_cycles > 0) {
+        safety_cycles--;
+        asm volatile("pause");
+    }
 }
 
 uint32_t pit_ticks(void) { return pit_tick_count; }
