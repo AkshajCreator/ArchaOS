@@ -1,0 +1,40 @@
+name: Sync Wiki Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/wiki/**'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      wiki: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Push to Wiki
+        run: |
+          WIKI_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
+          if git ls-remote "$WIKI_URL" &>/dev/null; then
+            git clone "$WIKI_URL" /tmp/wiki
+            cp docs/wiki/*.md /tmp/wiki/
+            cd /tmp/wiki
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "Auto-sync docs/wiki to GitHub Wiki"
+              git push origin HEAD
+              echo "Wiki successfully synchronized!"
+            else
+              echo "Wiki is already up to date."
+            fi
+          else
+            echo "Wiki repository has not been initialized yet on GitHub."
+          fi
