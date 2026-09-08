@@ -5,6 +5,8 @@
 It boots from an ISO image into a fully custom kernel featuring a brand-new **VGA graphical desktop environment**, an existing complete **interactive CLI shell**, a **virtual filesystem**, a super-simple **memory manager**, and a small suite of built-in GUI applications.
 
 > ⚡ **Zero Persistent Disk Footprint**: ArchaOS runs 100% in ephemeral system memory (RAM). It never touches, writes to, or mounts persistent user disks (ATA/IDE). Every reboot gives a fresh, pristine environment.
+>
+> 📖 **Comprehensive Documentation**: Explore the [ArchaOS GitHub Wiki](https://github.com/AkshajCreator/ArchaOS/wiki) (or browse [`docs/wiki/`](docs/wiki/)) for in-depth architectural specifications, hardware driver details, GUI application guides, and build instructions.
 
 ---
 
