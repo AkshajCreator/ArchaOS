@@ -5,6 +5,10 @@ build/
 *.iso
 *.img
 disk.img
+*.zip
+*.7z
+*.tar.gz
+ArchaOS/
 
 # Editor junk
 *.swp
@@ -20,3 +24,18 @@ MicroPython.txt
 
 # Temporary / Scratch
 my-app/
+src/user_binaries.h
+src/user_assets.h
+src/user_assets.asm
+user/access/*
+!user/access/.gitkeep
+
+tools/__pycache__/
+build/
+*.iso
+
+*.o
+*.a
+*.d
+.deps/
+

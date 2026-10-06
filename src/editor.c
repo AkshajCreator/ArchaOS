@@ -1,10 +1,11 @@
-// src/editor.c — ArchaOS GNU nano interactive text editor
 
 #include "editor.h"
 #include "fs.h"
 #include "vga.h"
 #include "mm.h"
 #include "idt.h"
+#include "keyboard.h"
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -178,38 +179,14 @@ static void ed_draw(const char *buf, int len, int cur, const char *fname, int mo
     ed_cur(cx, cy);
 }
 
-/* ── wait for next key scancode via IRQ1 ────────────── */
 static uint8_t ed_scancode(void)
 {
-    while (!irq_kbd_fired) asm volatile("sti; hlt");
-    uint8_t sc    = last_scancode;
-    irq_kbd_fired = 0;
-    return sc;
+    return keyboard_get_scancode();
 }
-
-/* ── keymaps ─────────────────────────────────────────── */
-static const char map_lo[128] = {
-    0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b',
-    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
-    'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',
-    'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',
-};
-static const char map_hi[128] = {
-    0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
-    '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
-    'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
-    'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',
-};
 
 static char ed_translate(uint8_t sc, int shift, int caps)
 {
-    if (sc >= 128) return 0;
-    char c = shift ? map_hi[sc] : map_lo[sc];
-    if (caps && !shift)
-    {
-        if (c >= 'a' && c <= 'z') c -= 32;
-    }
-    return c;
+    return keyboard_scancode_to_ascii(sc, shift, caps);
 }
 
 /* ── main nano entry point ───────────────────────────── */

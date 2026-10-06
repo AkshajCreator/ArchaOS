@@ -1,221 +1,147 @@
-# ArchaOS v0.5 "Monolith"
+# ArchaOS
 
-**ArchaOS** is a hobby 32-bit x86 monolithic operating system written entirely from scratch in **C** and **x86 Assembly** — no Linux, no GRUB modules, no borrowed kernel code, and zero runtime libc dependencies.
+ArchaOS is a 32-bit x86 hobby operating system written from scratch in C and x86 assembly. It boots via Multiboot (GRUB) or directly in QEMU, establishes protected mode, and implements core operating system primitives without external C runtime dependencies.
 
-It boots from an ISO image into a fully custom kernel featuring a brand-new **VGA graphical desktop environment**, an existing complete **interactive CLI shell**, a **virtual filesystem**, a super-simple **memory manager**, and a small suite of built-in GUI applications.
-
-> ⚡ **Zero Persistent Disk Footprint**: ArchaOS runs 100% in ephemeral system memory (RAM). It never touches, writes to, or mounts persistent user disks (ATA/IDE). Every reboot gives a fresh, pristine environment.
->
-> 📖 **Comprehensive Documentation**: Explore the [ArchaOS GitHub Wiki](https://github.com/AkshajCreator/ArchaOS/wiki) (or browse [`docs/wiki/`](docs/wiki/)) for in-depth architectural specifications, hardware driver details, GUI application guides, and build instructions.
+The project began as an educational monolithic kernel and is currently being refactored to separate the core kernel and device drivers from userland applications.
 
 ---
 
-## 📸 Screenshots
+## Features
 
-### Graphical Desktop (Mode 13h — 320×200, 256 colours)
-- Full **window manager** — drag, minimise, maximise (fullscreen), split-screen snap, close
-- **100% double-buffered** rendering — zero tearing, zero flickering, zero mouse trails
-- **PS/2 mouse** support with hardware-accurate 3-byte packet parsing
-- **Adaptive ProcessBar** (taskbar) with pixel-art program icons that scales with open windows
-- **Start Menu** with an intricate vertical ArchaOS side banner
-- Live **clock** reading directly from the CMOS RTC
-- **4 themes** — Classic Teal, Win31 Navy, Matrix Green, Amber Gold
-- **4 wallpapers** — Solid, Starfield, Cyber Grid, Sunset Lines
-- Settings saved automatically to `archaos.conf` on the RAM disk
+### Kernel Core
+- **Boot**: Multiboot-compliant bootloader entry (`boot.asm`) configuring protected mode and FPU.
+- **CPU & Memory**: Global Descriptor Table (GDT), Interrupt Descriptor Table (IDT), PIC 8259 remapping, and two-level paging with Virtual Memory Manager (VMM).
+- **Scheduler**: Preemptive round-robin task scheduler triggered by the PIT timer at 1000 Hz.
+- **Syscalls & Binaries**: Software interrupt `int 0x80` syscall dispatch and ELF32 binary loader (`elf.c`).
+- **Filesystem**: In-memory virtual filesystem (RAM disk) supporting hierarchical directories, file creation, reading, and writing.
 
-| Authentic GNU nano 0.5.0 Editor | Full ANSI Terminal Color Engine |
-| :---: | :---: |
-| ![GNU nano Editor](assets/screenshots/nano_editor.png) | ![ANSI Palette Demo](assets/screenshots/ansi_palette.png) |
+### Drivers & Hardware
+- **Input**: PS/2 keyboard driver with US QWERTY layout and modifier tracking, PS/2 mouse packet parsing.
+- **Video**: Standard VGA 80x25 text mode, Mode 13h (320x200 256-color), and VESA BIOS Extensions (VBE) high-resolution 800x600 32-bit linear framebuffer.
+- **Storage & Bus**: IDE/ATA hard disk driver and PCI bus enumeration.
+- **Networking**: Intel 82540EM (E1000) and Realtek RTL8139 drivers with ARP, IPv4, UDP, TCP, DHCP, and DNS support.
+- **Audio & Timing**: Sound Blaster 16 & OPL3 FM synthesizer, PC speaker frequency synth, and CMOS Real-Time Clock (RTC).
+- **Serial**: 16550 UART serial driver for kernel logging and debugging via COM1.
 
-| Reverse History Search (`Ctrl+R`) | Intelligent Word Wrap |
-| :---: | :---: |
-| ![Ctrl+R Search](assets/screenshots/ctrl_r_search.png) | ![Word Wrap](assets/screenshots/word_wrap.png) |
-
----
-
-## ✨ What's in ArchaOS v0.5
-
-### 1. Advanced CLI Shell & Terminal Engine
-- **Fish-Style Inline Autosuggestions**: As you type, commands match against history and system binaries, rendering a lookahead ghost suggestion in dim gray (`0x08`). Press **Right Arrow** or **Tab** to immediately accept.
-- **Reverse Incremental History Search (`Ctrl+R`)**: Real-time backwards interactive history search with query prompt `(reverse-i-search)\`<query>': <match>`. Press `Ctrl+R` to cycle through earlier matches, `Enter` to run, `Tab`/`Right Arrow` to edit, or `ESC`/`Ctrl+C` to cancel.
-- **Full ANSI Escape Sequence Engine**: In-kernel ANSI escape state machine supporting SGR foreground & background colors (30–37, 90–97, 40–47, 100–107 mapped to hardware VGA), bold, dim, inverse video, cursor positioning (`A/B/C/D`, `H/f`, save `s`, restore `u`), line/display erasing (`2J`, `2K`), and 8-column tab stop expansion.
-- **Intelligent ANSI-Aware Word Wrap**: Text output, the interactive command prompt, and GNU nano dynamically calculate visible word lengths (ignoring ANSI tags) and cleanly wrap lines at whitespace boundaries instead of splitting words across columns.
-- **Shell Productivity Shortcuts**: `Ctrl+L` (clear screen), `Ctrl+C` (cancel input line), `Ctrl+U` (clear before cursor), and 32-entry persistent history ring buffer (`Up`/`Down` arrows).
-
-### 2. Authentic GNU nano 0.5.0 Micro-Editor
-- Full interactive full-screen text editor (`nano <file>` or `edit <file>`).
-- Classic inverted top title bar with active filename and `[Modified]` flag.
-- 21-line text canvas with word wrap and dynamic cursor positioning.
-- Status feedback row (`[ Ln X, Col Y ]`, write confirmations).
-- Authentic two-row shortcut badge legend:
-  - `^O WriteOut` — save directly to RAM VFS
-  - `^K Cut Text` — cut line to clipboard
-  - `^U Paste Text` — uncut / paste line from clipboard
-  - `^X Exit` / `ESC` — exit safely back to shell
-
-### 3. Universal Unix Pipelines & Semicolon Sequencing
-- **Universal Pipeline Operator (`|`)**: Connect stdout of any command to stdin of another via ephemeral in-memory IPC pipe buffer (`help | grep Filesystem`, `fortune | wc`, `cat /general | less`).
-- **Command Sequencing (`;`)**: Chain multiple commands sequentially on a single line (`mkdir /test; touch /test/file.txt; ls /test`).
-- **Environment Variables**: Shell environment subsystem with `export VAR=val`, `env`, `unset VAR`, and runtime `$VAR` token substitution.
-
-### 4. Mode 13h Graphical Desktop & In-Browser Media
-- **Multi-Tier Window Shadows & Active Cyan Glow**: Windows cast soft ambient drop shadows on the desktop, and the currently focused window casts an active cyan perimeter glow.
-- **Window Snapping & Fullscreen**: Drag windows to the left or right screen boundary to snap 50/50 split-screen; drag to top or double-click titlebar to toggle maximize (`320×187`).
-- **Desktop File Icons & MIME Associations**: Dynamic desktop file icons with dedicated glyphs (`.txt`, `.wav`, `.vid`, `.py`) that automatically launch into their associated app on double-click.
-- **Consolidated In-Browser Media Engine**: Integrated docked media toolbar directly inside the web browser with playback controls (`>`, `||`), dual timecode (`01:23 / 03:45`), hover-timestamp scrubber gauge, and fullscreen mode.
-- **Speed Dial Bookmark Bar**: Instant one-click bookmarks (`Home`, `DuckDuckGo`, `Wikipedia`, `Media`) and `Ctrl+Tab` browser tab switching.
-- **Interrupt-Driven Background Audio**: Programmable Interval Timer (PIT) IRQ0 audio scheduler (~100 Hz) that plays synthesized melodies, WAVs, and chiptunes continuously in the background while multitasking.
-
-### 5. Bare-Metal Laptop & Pure UEFI Support (GOP Driver)
-- **Universal Dual-Mode Graphics Engine**: Automatically detects UEFI GOP (Graphics Output Protocol) 32-bit linear framebuffers or legacy VGA BIOS (Mode 13h / text mode `0xB8000`).
-- **Bare-Metal Class 3 UEFI Boot**: Full compatibility with modern Pure UEFI laptops (Intel 10th–14th Gen & AMD Ryzen) with zero CSM/Legacy BIOS requirements.
-- **ISOHybrid Packaging**: Flash directly to any USB drive (`dd if=ArchaOS.iso of=/dev/sdX bs=4M conv=fsync`) or boot in QEMU/VirtualBox.
+### User Interface & Shell
+- **Command Shell**: Unix-like command interpreter supporting pipelines (`|`), command chaining (`;`), environment variables, history, and tab completion.
+- **Terminal Utilities**: `nano` text editor, `less` pager, `hexdump`, `neofetch`, `matrix`, `mdview` (markdown reader), `hexedit` (interactive hex editor), `archmux` (terminal multiplexer), MicroPython REPL (`python`), and standard file commands (`ls`, `cat`, `mkdir`, `cp`, `rm`, `grep`, `wc`).
+- **Hardware Telemetry (`coreview`)**: Real-time silicon monitor showing CPU registers, bitfield flip transitions, memory waterfall heat map, and GPU/CRTC raster oscilloscope.
+- **Graphical Desktop (`gui`)**: Mode 13h and VESA 800x600 true-color window manager featuring dual virtual workspaces (`Ctrl+1`/`Ctrl+2`), QuickRunner spotlight launcher (`Alt+Space`), 3D screensavers (Cube, Mystify, Starfield), window dragging, maximize/snapping, taskbar pager, start menu, desktop icons, and bundled applets (Notepad, File Manager, Calculator, Painter with 9 tools, Minesweeper, Snake, DOOM).
 
 ---
 
-## 🖥️ Built-in GUI Applications
+## Getting Started
 
-| Application | Description |
-|---|---|
-| **Web Browser** | NetSurf HTML engine, JS runtime, NanoSVG vector decoder, Speed Dial bookmarks, and universal docked media player |
-| **Terminal CLI** | Embedded Mode 13h terminal window with live command execution and output capture |
-| **App Studio** | Integrated IDE & Script Studio for editing and running native MicroPython and Tiny C Compiler (TCC) scripts |
-| **File Manager** | RAM disk navigator with toolbar actions (+File, +Dir, Edit, Delete), item properties, and MIME launching |
-| **Notepad** | Interactive text editor with full ASCII typing, blinking cursor, and RAM disk persistence |
-| **Painter** | 256-color drawing tool with pencil, brush, eraser, flood fill, custom palette, and canvas clear |
-| **Calculator** | 4-function arithmetic calculator with interactive button grid |
-| **Minesweeper** | Classic 8×8 minefield with PRNG mine placement, right-click flagging, and win/loss detection |
-| **Snake** | Retro arcade Snake game with score tracking, speed scaling, sound effects, and restart overlay |
-| **Control Panel** | System configuration: switch between 4 themes and 4 wallpapers, saved to `archaos.conf` |
-| **Task Manager** | Inspect active desktop windows, memory heap utilization, and kill processes |
-| **Image Viewer** | Preview `.bmp` drawings and graphics with Open/Save controls |
+### Prerequisites
 
----
-
-## ⌨️ Shell Command Reference
-
-| Category | Commands |
-|---|---|
-| **System** | `help`, `new`, `general`, `clear` / `cls`, `reboot`, `halt`, `uptime`, `date`, `top`, `neofetch`, `fortune`, `theme <name>`, `matrix`, `credits`, `meminfo`, `memtest` |
-| **Filesystem** | `ls [path]`, `tree [path]`, `cd <path>`, `pwd`, `mkdir <path>`, `touch <file>`, `cat <file>`, `less <file>`, `nano <file>`, `head <file>`, `tail <file>`, `stat <file>`, `hexdump <file>`, `write <file> <text>`, `rm <file>`, `cp <src> <dst>`, `mv <src> <dst>`, `wc <file>`, `grep <pat> <file>`, `find` |
-| **Networking** | `ifconfig`, `ping <host>`, `curl <url>`, `wget <url> [-O file]`, `ports` |
-| **Shell & Env** | `export VAR=val`, `env`, `unset VAR`, `$VAR`, `cmd1; cmd2`, `cmd1 | cmd2`, `alias`, `unalias`, `run <script>`, `ansi` / `colors`, `echo [-e] <text>` |
-| **AI Assistant** | `ai <prompt>` (persistent multi-turn chat), `ai clear`, `ai history` |
-| **Multimedia** | `audio [play|stop|pause|next|prev|list]`, `video`, `beep` |
-| **Hardware** | `pci [list|scan]`, `serial [com1|com2] [write|read|status]`, `ata` |
-| **Graphical** | `gui` (enters Mode 13h desktop environment) |
-
----
-
-## ⌨️ Keyboard Shortcuts Reference
-
-| Context | Shortcut | Action |
-|---|---|---|
-| **CLI Shell** | `Tab` or `Right Arrow` | Accept inline autosuggestion |
-| | `Ctrl + R` | Interactive reverse history search |
-| | `Ctrl + L` | Clear screen buffer |
-| | `Ctrl + C` | Cancel current command line |
-| | `Ctrl + U` | Erase line before cursor |
-| | `Up` / `Down` | Navigate command history |
-| | `Shift + PgUp / PgDn` | Scroll terminal scrollback buffer |
-| **GNU nano** | `Ctrl + O` | Write out / save to file |
-| | `Ctrl + K` | Cut current line to clipboard |
-| | `Ctrl + U` | Paste / uncut text from clipboard |
-| | `Ctrl + X` / `ESC` | Exit editor |
-| **GUI Desktop** | `Alt + Enter` / `F11` | Toggle window maximize / restore |
-| | `Ctrl + W` / `Alt + F4` | Close focused window |
-| | `Ctrl + Tab` | Cycle active browser tabs |
-| | `Ctrl + +` / `Ctrl + -` | Adjust system volume HUD |
-| | `ESC` | Return from GUI to CLI shell |
-
----
-
-## 🛠️ Toolchain & Requirements
-
-| Tool | Purpose |
-|---|---|
-| `gcc` | Freestanding C compiler (32-bit multilib) |
-| `nasm` | x86 assembly assembler |
-| `ld` | GNU ELF32 linker |
-| `grub-mkrescue` | Multiboot ISO generator |
-| `xorriso` | RockRidge ISO filesystem builder |
-| `qemu-system-i386` | Emulation and testing |
-
-### Install Dependencies (Debian / Ubuntu / Pop!_OS)
+On Debian, Ubuntu, or Pop!_OS:
 ```bash
 sudo apt update
 sudo apt install -y gcc-multilib nasm binutils grub-pc-bin grub-common xorriso qemu-system-x86
 ```
 
----
-
-## 🚀 Building & Running
-
-### Build Classic Edition (VGA Mode 13h / BIOS / QEMU):
+On Fedora:
 ```bash
-make clean && make iso
+sudo dnf install -y gcc nasm binutils grub2-tools-extra xorriso qemu-system-x86 glibc-devel.i686
 ```
-Produces `ArchaOS.iso`.
 
-### Build UEFI Edition (Pure UEFI Class 3 / GOP):
+On Arch Linux:
 ```bash
-make uefi
+sudo pacman -S gcc nasm binutils grub xorriso qemu-system-x86 lib32-glibc
 ```
-Produces `ArchaOS-UEFI.iso`.
 
-### Run Classic in QEMU:
+### Building the ISO
+
+ArchaOS supports both the modern **Limine Bootloader** (default, dual BIOS + UEFI bootable) and legacy GRUB:
+
+- **Build Limine ISO (Default)**:
+  ```bash
+  make iso
+  ```
+  *(Or explicitly `make limine-iso`)*. This compiles the self-contained Limine installer and builds a dual BIOS + UEFI bootable `ArchaOS.iso`.
+
+- **Build Legacy GRUB ISO**:
+  ```bash
+  make grub-iso
+  ```
+
+### Running in QEMU
+
+To run the compiled ISO in QEMU:
 ```bash
 make run
 ```
+*(Or specifically `make run-limine` or `make run-grub`)*
 
-### Run UEFI in QEMU (with OVMF):
+To run with serial debug output directed to your terminal:
 ```bash
-make run-uefi
+make run-serial
 ```
 
 ---
 
-## 📂 Project Structure
+## Prebuilt Releases
+
+Bootable ISO images and release archives are published under [GitHub Releases](https://github.com/AkshajCreator/ArchaOS/releases). Binary archives are kept out of the git repository to keep clone sizes minimal.
+
+---
+
+## Repository Structure
 
 ```
 ArchaOS/
-├── assets/
-│   └── screenshots/      # Desktop, terminal, nano, and browser media screenshots
-├── boot/
-│   └── grub/             # GRUB configuration
-├── src/
-│   ├── boot.asm          # Multiboot entry point, protected mode, FPU init
-│   ├── isr_stubs.asm     # CPU exception & IRQ assembly stubs
-│   ├── kernel.c          # Kernel main, CLI shell dispatcher, built-in commands
-│   ├── vga.c             # VGA text driver, ANSI state machine, autosuggest, Ctrl+R, word wrap
-│   ├── gui.c             # Mode 13h desktop compositor, window manager, browser, media player
-│   ├── idt.c             # Interrupt Descriptor Table & PIC 8259A remap
-│   ├── mm.c              # Heap memory allocator (kmalloc/kfree)
-│   ├── fs.c              # Virtual in-memory filesystem (RAM disk)
-│   ├── editor.c          # GNU nano 0.5.0 micro-editor
-│   ├── shellext.c        # Unix pipelines |, ;, $VAR expansion, aliases
-│   ├── audio.c / pit.c   # PIT IRQ0 background audio scheduler
-│   ├── less.c            # Paginated interactive viewer (less/more) with dynamic word-wrap
-│   ├── matrix.c          # Animated digital rain screensaver
-│   ├── wget.c            # HTTP/Web download tool
-│   ├── net/              # E1000 NIC driver, IP, UDP, TCP, DHCP, DNS, NetSurf & BearSSL
-│   ├── ai.c              # Online AI assistant (NIM & DeepSeek via E1000 networking)
-│   ├── pci.c / serial.c  # PCI enumeration & 16550 UART serial driver
-│   ├── neofetch.c        # System information utility
-│   ├── splash.c          # Animated boot splash
-│   └── linker.ld         # Freestanding ELF32 linker script
-├── Makefile
-└── README.md
+├── boot/             # GRUB multiboot configuration
+├── docs/             # Architecture and design documentation
+├── tools/            # User binary embedding and packaging tools
+├── user/             # Standalone Ring 3 User Space & Libc
+│   ├── linker.ld     # Userland ELF linker script (0x08048000)
+│   ├── crt0.asm      # C runtime entry point (_start)
+│   ├── lib/          # Freestanding C library (libc.c/.h, syscall.h)
+│   └── bin/          # Standalone user programs (hello, echo, cat, sh)
+├── src/              # Monolithic Operating System Kernel (0xC0000000)
+│   ├── boot.asm      # Higher-Half multiboot entry point & bootstrap paging
+│   ├── isr_stubs.asm # Interrupt service routine assembly stubs
+│   ├── gdt.c/.h      # Global Descriptor Table & TSS
+│   ├── idt.c/.h      # Interrupt Descriptor Table & PIC
+│   ├── vmm.c/.h      # Higher-Half Two-Tier Paging & VMM
+│   ├── mm.c/.h       # Dynamic on-demand paged heap allocator (0xC2000000)
+│   ├── task.c/.h     # Preemptive Priority Scheduler & Ring 3 context switching
+│   ├── syscall.c/.h  # POSIX syscall handler (int 0x80)
+│   ├── elf.c/.h      # ELF32 executable loader
+│   ├── keyboard.c/.h # Centralized PS/2 keyboard driver
+│   ├── string.c/.h   # Centralized C string and memory routines
+│   ├── vga.c/.h      # VGA text mode console driver
+│   ├── vesa.c/.h     # VESA linear framebuffer graphics
+│   ├── gui.c/.h      # Desktop compositor and window manager
+│   ├── coreview.c/.h # Hardware silicon telemetry monitor
+│   ├── fs.c/.h       # Virtual filesystem
+│   ├── editor.c/.h   # Text editor
+│   ├── shellext.c/.h # Shell pipeline and environment handling
+│   ├── pit.c/.h      # Programmable Interval Timer
+│   ├── ata.c/.h      # ATA hard disk driver
+│   ├── pci.c/.h      # PCI bus scanner
+│   ├── serial.c/.h   # 16550 UART serial driver
+│   ├── audio.c/.h    # PC speaker sound driver
+│   ├── net/          # Network stack and device drivers
+│   └── kernel.c      # Kernel entry and command dispatcher
+├── tests/            # Test scripts and harnesses
+└── Makefile          # Build configuration
 ```
 
 ---
 
-## 📜 Licence
+## Roadmap
 
-- Type `gui` in the shell to launch the graphical desktop
-- Press **ESC** inside the GUI to return to the shell
-- **Right-click** in Minesweeper to place/remove a flag
-- Type `help` in the shell for a full command list
-- Theme and wallpaper changes in Control Panel are persisted in `archaos.conf`
+- [x] **Monolithic Higher-Half Architecture**: Kernel linked and mapped at `0xC0000000` with dual-mapped bootstrap paging.
+- [x] **Userland Separation & Ring 3 Execution**: Standalone ELF binaries running in Ring 3 unprivileged mode isolated from Ring 0.
+- [x] **Hardware-Level VMM Isolation**: User processes run on dedicated page directories (`user_pd`) preventing access to supervisor memory.
+- [x] **Freestanding C Library**: Freestanding libc with `printf`, `malloc`, `free`, `sbrk`, `read`, `write`, `open`, `close`, `sleep`, `yield`, `spawn`, `getpid`, `exit`.
+- [x] **POSIX Syscall Dispatch**: Software interrupt `int 0x80` trap dispatching between Ring 3 and Ring 0.
+- [ ] **Storage Persistence**: Mount FAT12/FAT16/ext2 filesystems over the ATA driver for permanent storage.
 
-*Crafted from scratch with ❤️ by [AkshajCreator](https://github.com/AkshajCreator)*
+---
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.

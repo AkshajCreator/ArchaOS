@@ -5,11 +5,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define HEAP_VIRT_BASE 0xC2000000
+
 /* Call once at boot with total detected RAM in bytes */
 void  mm_init(uint32_t detected_ram_bytes);
 void *kmalloc(size_t size);
 void *krealloc(void *ptr, size_t new_size);
 void  kfree(void *ptr);
+void *mm_get_heap_base(void);
 
 /* Detected RAM (set by mm_init, readable by kernel) */
 extern uint32_t mm_total_ram;

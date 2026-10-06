@@ -1,4 +1,3 @@
-// src/shellext.h — shell extensions: aliases, redirection, pipes, script runner
 #ifndef SHELLEXT_H
 #define SHELLEXT_H
 

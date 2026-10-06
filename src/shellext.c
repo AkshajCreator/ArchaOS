@@ -11,36 +11,14 @@
 #include "vga.h"
 #include "fs.h"
 #include "serial.h"
+#include "elf.h"
+#include "task.h"
+#include "keyboard.h"
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 
-/* ============================================================
- * STRING HELPERS
- * ============================================================ */
 
-static int se_strlen(const char *s)
-{ int n=0; while(s[n]) n++; return n; }
-
-static __attribute__((unused)) void se_strcpy(char *d, const char *s)
-{ while((*d++=*s++)); }
-
-static void se_strncpy(char *d, const char *s, int n)
-{ int i = 0; while (i < n - 1 && s[i]) { d[i] = s[i]; i++; } d[i] = '\0'; }
-
-/* se_strcat removed as unused */
-
-static int se_strcmp(const char *a, const char *b)
-{ while(*a&&*a==*b){a++;b++;} return *(unsigned char*)a-*(unsigned char*)b; }
-
-static int se_strncmp(const char *a, const char *b, int n)
-{ while(n&&*a&&*a==*b){a++;b++;n--;} return n?(*(unsigned char*)a-*(unsigned char*)b):0; }
-
-/* se_memset removed as unused */
-
-/* ============================================================
- * CAPTURE BUFFER
- * Used to intercept vga_print output for pipes/redirection
- * ============================================================ */
 
 #define CAP_SIZE 4096
 static char    cap_buf[CAP_SIZE];
@@ -76,9 +54,7 @@ const char *shellext_get_captured(void)
     return cap_buf;
 }
 
-/* ============================================================
- * ALIAS TABLE
- * ============================================================ */
+
 
 #define MAX_ALIASES  16
 #define ALIAS_NAMELEN 24
@@ -92,8 +68,8 @@ void alias_set(const char *name, const char *value)
 {
     /* Update existing */
     for (int i=0;i<alias_count;i++) {
-        if (se_strcmp(aliases[i].name, name)==0) {
-            int vl=se_strlen(value);
+        if (strcmp(aliases[i].name, name)==0) {
+            int vl=strlen(value);
             if(vl>=ALIAS_VALLEN) vl=ALIAS_VALLEN-1;
             int j; for(j=0;j<vl;j++) aliases[i].val[j]=value[j];
             aliases[i].val[j]='\0';
@@ -102,8 +78,8 @@ void alias_set(const char *name, const char *value)
         }
     }
     if (alias_count >= MAX_ALIASES) { vga_print("alias: table full\n"); return; }
-    int nl=se_strlen(name); if(nl>=ALIAS_NAMELEN) nl=ALIAS_NAMELEN-1;
-    int vl=se_strlen(value); if(vl>=ALIAS_VALLEN) vl=ALIAS_VALLEN-1;
+    int nl=strlen(name); if(nl>=ALIAS_NAMELEN) nl=ALIAS_NAMELEN-1;
+    int vl=strlen(value); if(vl>=ALIAS_VALLEN) vl=ALIAS_VALLEN-1;
     int i; for(i=0;i<nl;i++) aliases[alias_count].name[i]=name[i];
     aliases[alias_count].name[i]='\0';
     for(i=0;i<vl;i++) aliases[alias_count].val[i]=value[i];
@@ -127,8 +103,8 @@ static const char *alias_expand(const char *cmd)
 {
     /* Match first word of cmd against alias names */
     for (int i=0;i<alias_count;i++) {
-        int nl = se_strlen(aliases[i].name);
-        if (se_strncmp(cmd, aliases[i].name, nl)==0 &&
+        int nl = strlen(aliases[i].name);
+        if (strncmp(cmd, aliases[i].name, nl)==0 &&
             (cmd[nl]=='\0'||cmd[nl]==' '))
         {
             static char expanded[256];
@@ -147,9 +123,7 @@ static const char *alias_expand(const char *cmd)
     return 0;
 }
 
-/* ============================================================
- * ENVIRONMENT VARIABLES
- * ============================================================ */
+
 
 #define MAX_ENV_VARS  32
 #define ENV_NAMELEN   24
@@ -184,8 +158,8 @@ void env_set(const char *name, const char *value)
 
     /* Update existing */
     for (int i = 0; i < env_count; i++) {
-        if (se_strcmp(env_vars[i].name, name) == 0) {
-            int vl = se_strlen(value);
+        if (strcmp(env_vars[i].name, name) == 0) {
+            int vl = strlen(value);
             if (vl >= ENV_VALLEN) vl = ENV_VALLEN - 1;
             int j; for (j = 0; j < vl; j++) env_vars[i].val[j] = value[j];
             env_vars[i].val[j] = '\0';
@@ -193,8 +167,8 @@ void env_set(const char *name, const char *value)
         }
     }
     if (env_count >= MAX_ENV_VARS) { vga_print("export: environment table full\n"); return; }
-    int nl = se_strlen(name); if (nl >= ENV_NAMELEN) nl = ENV_NAMELEN - 1;
-    int vl = se_strlen(value); if (vl >= ENV_VALLEN) vl = ENV_VALLEN - 1;
+    int nl = strlen(name); if (nl >= ENV_NAMELEN) nl = ENV_NAMELEN - 1;
+    int vl = strlen(value); if (vl >= ENV_VALLEN) vl = ENV_VALLEN - 1;
     int i; for (i = 0; i < nl; i++) env_vars[env_count].name[i] = name[i];
     env_vars[env_count].name[i] = '\0';
     for (i = 0; i < vl; i++) env_vars[env_count].val[i] = value[i];
@@ -206,7 +180,7 @@ const char *env_get(const char *name)
 {
     if (!env_initialized) env_init();
     for (int i = 0; i < env_count; i++) {
-        if (se_strcmp(env_vars[i].name, name) == 0) {
+        if (strcmp(env_vars[i].name, name) == 0) {
             return env_vars[i].val;
         }
     }
@@ -217,7 +191,7 @@ void env_unset(const char *name)
 {
     if (!env_initialized) env_init();
     for (int i = 0; i < env_count; i++) {
-        if (se_strcmp(env_vars[i].name, name) == 0) {
+        if (strcmp(env_vars[i].name, name) == 0) {
             for (int j = i; j < env_count - 1; j++) env_vars[j] = env_vars[j + 1];
             env_count--;
             return;
@@ -264,9 +238,7 @@ static void env_expand_str(const char *in, char *out, int out_sz)
     out[oi] = '\0';
 }
 
-/* ============================================================
- * wc COMMAND
- * ============================================================ */
+
 
 static void cmd_wc(const char *path)
 {
@@ -289,9 +261,7 @@ static void cmd_wc(const char *path)
     vga_print("\n");
 }
 
-/* ============================================================
- * grep COMMAND
- * ============================================================ */
+
 
 static void cmd_grep(const char *pattern, const char *path)
 {
@@ -299,7 +269,7 @@ static void cmd_grep(const char *pattern, const char *path)
     if (fs_cat(path, buf, sizeof(buf)) < 0) {
         vga_print("grep: no such file\n"); return;
     }
-    int plen = se_strlen(pattern);
+    int plen = strlen(pattern);
     int found = 0;
 
     /* Walk line by line */
@@ -312,7 +282,7 @@ static void cmd_grep(const char *pattern, const char *path)
         /* Search pattern in line [i..j) */
         int hit=0;
         for (int k=i; k<j-plen+1; k++) {
-            if (se_strncmp(buf+k, pattern, plen)==0) { hit=1; break; }
+            if (strncmp(buf+k, pattern, plen)==0) { hit=1; break; }
         }
         if (hit) {
             /* Print the line */
@@ -325,14 +295,62 @@ static void cmd_grep(const char *pattern, const char *path)
     if (!found) vga_print("(no matches)\n");
 }
 
-/* ============================================================
- * SCRIPT RUNNER
- * ============================================================ */
 
-void script_run(const char *path)
+
+void script_run(const char *cmd_line)
 {
+    while (*cmd_line == ' ') cmd_line++;
+    if (!*cmd_line) {
+        vga_print("usage: run <path_to_binary_or_script> [args...]\n");
+        return;
+    }
+
+    /* Extract binary / script path (first token) */
+    char raw_path[64];
+    int pi = 0;
+    const char *p = cmd_line;
+    while (*p && *p != ' ' && pi < 63) {
+        raw_path[pi++] = *p++;
+    }
+    raw_path[pi] = '\0';
+
+    /* Check if target is an ELF binary */
+    char elf_path[64];
+    resolve_elf_path(raw_path, elf_path, sizeof(elf_path));
+    fs_node_t *node = fs_resolve(elf_path);
+
+    if (node && node->data && node->size >= 4 &&
+        node->data[0] == 0x7F && node->data[1] == 'E' &&
+        node->data[2] == 'L' && node->data[3] == 'F') {
+        int pid = elf_load_file_args(elf_path, cmd_line);
+        if (pid > 0) {
+            /* Synchronously wait for foreground user process to complete with Ctrl+C interrupt support */
+            while (task_is_running(pid)) {
+                if (keyboard_has_char()) {
+                    char ch = keyboard_getchar();
+                    if (ch == 3 || ch == 27) {
+                        vga_print("^C\n");
+                        task_kill((uint32_t)pid);
+                        break;
+                    }
+                }
+                task_sleep(10);
+            }
+        } else {
+            vga_print("Error: Failed to load ELF binary '"); vga_print(elf_path); vga_print("'\n");
+        }
+        return;
+    }
+
+    /* Otherwise, attempt to execute as a shell script */
+    node = fs_resolve(raw_path);
+    if (!node) {
+        vga_print("run: no such file\n");
+        return;
+    }
+
     char buf[2048];
-    if (fs_cat(path, buf, sizeof(buf)) < 0) {
+    if (fs_cat(raw_path, buf, sizeof(buf)) < 0) {
         vga_print("run: no such file\n"); return;
     }
 
@@ -353,11 +371,8 @@ void script_run(const char *path)
     }
 }
 
-/* ============================================================
- * OUTPUT REDIRECTION HELPER
- * Runs cmd with output captured, then writes to file.
- * mode: 0 = overwrite (>), 1 = append (>>)
- * ============================================================ */
+
+
 
 static char redir_existing[CAP_SIZE];
 static char redir_combined[CAP_SIZE * 2];
@@ -372,7 +387,7 @@ static void exec_with_redirect(const char *cmd, const char *file, int append)
         /* Read existing content */
         redir_existing[0] = '\0';
         fs_cat(file, redir_existing, sizeof(redir_existing));
-        int el = se_strlen(redir_existing);
+        int el = strlen(redir_existing);
         /* Append new content */
         int ci = 0;
         for (int i = 0; i < el && ci < (int)(sizeof(redir_combined) - 1); i++)
@@ -386,12 +401,7 @@ static void exec_with_redirect(const char *cmd, const char *file, int append)
     }
 }
 
-/* ============================================================
- * PIPE HELPER
- * Runs left side with capture, feeds output as input to right.
- * Currently supports: <cmd> | grep <pattern>
- *                     <cmd> | wc
- * ============================================================ */
+
 
 static void exec_pipe(const char *left, const char *right)
 {
@@ -407,7 +417,8 @@ static void exec_pipe(const char *left, const char *right)
 
     /* Build right-side command with temp file */
     char right_cmd[128];
-    se_strncpy(right_cmd, right, sizeof(right_cmd));
+    strncpy(right_cmd, right, sizeof(right_cmd) - 1);
+    right_cmd[sizeof(right_cmd) - 1] = '\0';
 
     /* Trim leading spaces */
     int r = 0; while (right_cmd[r] == ' ') r++;
@@ -415,13 +426,13 @@ static void exec_pipe(const char *left, const char *right)
 
     /* Handle pipe consumers */
     extern void cmd_less(const char *path);
-    if (se_strncmp(rcmd, "grep ", 5) == 0) {
+    if (strncmp(rcmd, "grep ", 5) == 0) {
         cmd_grep(rcmd + 5, TMPFILE);
-    } else if (se_strcmp(rcmd, "wc") == 0) {
+    } else if (strcmp(rcmd, "wc") == 0) {
         cmd_wc(TMPFILE);
-    } else if (se_strcmp(rcmd, "less") == 0 || se_strcmp(rcmd, "more") == 0) {
+    } else if (strcmp(rcmd, "less") == 0 || strcmp(rcmd, "more") == 0) {
         cmd_less(TMPFILE);
-    } else if (se_strncmp(rcmd, "less ", 5) == 0 || se_strncmp(rcmd, "more ", 5) == 0) {
+    } else if (strncmp(rcmd, "less ", 5) == 0 || strncmp(rcmd, "more ", 5) == 0) {
         shell_exec(rcmd);
     } else {
         /* General command consumer: append TMPFILE if right command has no arguments */
@@ -446,10 +457,7 @@ static void exec_pipe(const char *left, const char *right)
     fs_rm(TMPFILE);
 }
 
-/* ============================================================
- * SHELL_EXEC — main entry point
- * Preprocesses command then dispatches.
- * ============================================================ */
+
 
 static int exec_depth = 0;
 #define MAX_EXEC_DEPTH 8
@@ -497,7 +505,7 @@ static void shell_exec_internal(const char *raw)
     const char *cmd = expanded ? expanded : env_expanded;
 
     /* ── export command ── */
-    if (se_strncmp(cmd, "export ", 7) == 0) {
+    if (strncmp(cmd, "export ", 7) == 0) {
         const char *rest = cmd + 7;
         while (*rest == ' ') rest++;
         int ei = 0; while (rest[ei] && rest[ei] != '=') ei++;
@@ -513,25 +521,25 @@ static void shell_exec_internal(const char *raw)
         env_set(name, rest + ei + 1);
         return;
     }
-    if (se_strcmp(cmd, "export") == 0 || se_strcmp(cmd, "env") == 0) {
+    if (strcmp(cmd, "export") == 0 || strcmp(cmd, "env") == 0) {
         env_list();
         return;
     }
 
     /* ── unset command ── */
-    if (se_strncmp(cmd, "unset ", 6) == 0) {
+    if (strncmp(cmd, "unset ", 6) == 0) {
         const char *name = cmd + 6;
         while (*name == ' ') name++;
         env_unset(name);
         return;
     }
-    if (se_strcmp(cmd, "unset") == 0) {
+    if (strcmp(cmd, "unset") == 0) {
         vga_print("usage: unset <NAME>\n");
         return;
     }
 
     /* ── alias command ── */
-    if (se_strncmp(cmd, "alias ", 6)==0) {
+    if (strncmp(cmd, "alias ", 6)==0) {
         /* alias name=value */
         const char *rest = cmd+6;
         while(*rest==' ') rest++;
@@ -546,14 +554,14 @@ static void shell_exec_internal(const char *raw)
         return;
     }
 
-    if (se_strcmp(cmd, "alias")==0) { alias_list(); return; }
+    if (strcmp(cmd, "alias")==0) { alias_list(); return; }
 
     /* ── unalias ── */
-    if (se_strncmp(cmd, "unalias ", 8)==0) {
+    if (strncmp(cmd, "unalias ", 8)==0) {
         const char *name=cmd+8;
         while(*name==' ') name++;
         for(int i=0;i<alias_count;i++) {
-            if(se_strcmp(aliases[i].name,name)==0) {
+            if(strcmp(aliases[i].name,name)==0) {
                 for(int j=i;j<alias_count-1;j++) aliases[j]=aliases[j+1];
                 alias_count--;
                 vga_print("alias removed\n"); return;
@@ -561,14 +569,14 @@ static void shell_exec_internal(const char *raw)
         }
         vga_print("unalias: not found\n"); return;
     }
-    if (se_strcmp(cmd, "unalias")==0) { vga_print("usage: unalias <name>\n  Removes a command alias.\n"); return; }
+    if (strcmp(cmd, "unalias")==0) { vga_print("usage: unalias <name>\n  Removes a command alias.\n"); return; }
 
     /* ── wc ── */
-    if (se_strncmp(cmd, "wc ", 3)==0) { cmd_wc(cmd+3); return; }
-    if (se_strcmp(cmd, "wc")==0) { vga_print("usage: wc <file>\n  Counts lines, words, and characters in a file.\n"); return; }
+    if (strncmp(cmd, "wc ", 3)==0) { cmd_wc(cmd+3); return; }
+    if (strcmp(cmd, "wc")==0) { vga_print("usage: wc <file>\n  Counts lines, words, and characters in a file.\n"); return; }
 
     /* ── grep ── */
-    if (se_strncmp(cmd, "grep ", 5)==0) {
+    if (strncmp(cmd, "grep ", 5)==0) {
         const char *rest=cmd+5;
         /* grep <pattern> <file> */
         while(*rest==' ') rest++;
@@ -582,18 +590,18 @@ static void shell_exec_internal(const char *raw)
         cmd_grep(pat, file);
         return;
     }
-    if (se_strcmp(cmd, "grep")==0) { vga_print("usage: grep <pattern> <file>\n  Searches for a text pattern in a file.\n"); return; }
+    if (strcmp(cmd, "grep")==0) { vga_print("usage: grep <pattern> <file>\n  Searches for a text pattern in a file.\n"); return; }
 
     /* ── history ── */
-    if (se_strcmp(cmd, "history")==0) {
+    if (strcmp(cmd, "history")==0) {
         extern void vga_print_history(void);
         vga_print_history();
         return;
     }
 
     /* ── run (script) ── */
-    if (se_strncmp(cmd, "run ", 4)==0) { script_run(cmd+4); return; }
-    if (se_strcmp(cmd, "run")==0) { vga_print("usage: run <script>\n  Executes shell commands from a script file.\n"); return; }
+    if (strncmp(cmd, "run ", 4)==0) { script_run(cmd+4); return; }
+    if (strcmp(cmd, "run")==0) { vga_print("usage: run <script>\n  Executes shell commands from a script file.\n"); return; }
 
     /* ── Scan for pipe | ── */
     /* Find | not inside quotes */
@@ -654,9 +662,7 @@ void shell_exec(const char *raw)
     exec_depth--;
 }
 
-/* ============================================================
- * CLIPBOARD & SERIAL COM1 SYNC
- * ============================================================ */
+
 static char clipboard_buf[2048] = "";
 static int  clipboard_len = 0;
 

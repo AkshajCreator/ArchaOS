@@ -1,4 +1,3 @@
-// src/gui.c — ArchaOS v0.5 Desktop & Program Suite
 // VGA Mode 13h: 320x200, 256 colors, linear framebuffer at 0xA0000
 // 100% Double-Buffered: 0% Tearing, 0% Flickering, 0% Mouse Trails!
 
@@ -20,16 +19,19 @@
 #include "net/image_decoder.h"
 #include "audio.h"
 #include "video.h"
-#include "net/nim.h"
-#include "ai.h"
+#include "keyboard.h"
+#include "string.h"
 #include "net/media_fetch.h"
 #include "serial.h"
+#include "task.h"
+#include "vesa.h"
+#include "font_engine.h"
+#include "coreview.h"
+#include "elf.h"
 #include <stdint.h>
 #include <stddef.h>
 
-/* ============================================================
- * PORT I/O & VGA MODE SWITCHING
- * ============================================================ */
+
 
 static inline void outb(uint16_t port, uint8_t val)
 { asm volatile("outb %0,%1"::"a"(val),"Nd"(port)); }
@@ -39,6 +41,7 @@ static inline uint8_t inb(uint16_t port)
 
 #define SCREEN_W   320
 #define SCREEN_H   200
+#define TASKBAR_Y  188
 #define FB_ADDR    0xA0000
 
 /* 64 KB Off-screen Backbuffer for Double Buffering */
@@ -168,17 +171,80 @@ static inline void fast_memcpy_dw(uint32_t *dst, const uint32_t *src, uint32_t c
     );
 }
 
-/* Ultra-Fast 32-bit Frame Flip to VGA Memory 0xA0000 */
-static void gui_flip(void)
-{
-    uint32_t *dst = (uint32_t *)FB_ADDR;
-    uint32_t *src = (uint32_t *)backbuffer;
-    fast_memcpy_dw(dst, src, (SCREEN_W * SCREEN_H) / 4);
+int gui_vesa_active = 0;
+int gui_force_vga = 0;
+static uint32_t vesa_palette[256];
+
+void gui_set_force_vga(int force) {
+    gui_force_vga = force;
 }
 
-/* ============================================================
- * PALETTE & COLORS
- * ============================================================ */
+
+/* Forward declaration — implementation after all state variable declarations */
+static void vesa_render_active_window(uint32_t *vbb);
+static void vesa_draw_mouse_cursor(uint32_t *vbb, int mx, int my);
+static gui_window_t windows[MAX_WINDOWS];
+static int win_count = 0;
+static int focused_win = -1;
+static int start_menu_open = 0;
+static int ctx_menu_open = 0;
+static int watchdog_modal_active = 0;
+static int quickrunner_active = 0;
+
+/* Ultra-Fast Frame Flip: VESA 800x600 32-Bit Framebuffer or Mode 13h 0xA0000 */
+static void gui_flip(void)
+{
+    if (gui_vesa_active) {
+        uint32_t *vbb = vesa_get_backbuffer();
+        if (!vbb) return;
+
+        /* === Unified Full-Screen Upscale: 320x200 → all 800x600 pixels ===
+         * Single back-projection: sx = dx*320/800, sy = dy*200/600.
+         * Horizontal: 2.5× scale. Vertical: 3× scale.
+         * Zero black bars, zero letterboxing, zero duplication. */
+        for (int dy = 0; dy < 600; dy++) {
+            int sy = (dy * SCREEN_H) / 600;
+            if (sy >= SCREEN_H) sy = SCREEN_H - 1;
+            const uint8_t *s = backbuffer + sy * SCREEN_W;
+            uint32_t *d = vbb + dy * 800;
+            for (int dx = 0; dx < 800; dx++) {
+                int sx = (dx * SCREEN_W) / 800;
+                if (sx >= SCREEN_W) sx = SCREEN_W - 1;
+                d[dx] = vesa_palette[s[sx]];
+            }
+        }
+
+        /* === Native VESA content overlay ===
+         * Re-render focused window content (browser/notepad/imgview/coreview)
+         * directly at 800x600 — true HD quality, no upscale blur.
+         * Do not overwrite Start Menu, Context Menu, or Watchdog Modal. */
+        if (!start_menu_open && !ctx_menu_open && !watchdog_modal_active && !quickrunner_active) {
+            vesa_render_active_window(vbb);
+        }
+
+        /* === Native VESA Mouse Cursor on Top of Everything ===
+         * Rendered directly onto the final 800x600 buffer so the cursor
+         * never disappears or gets overwritten by window overlays. */
+        int hide_cur = 0;
+        if (focused_win >= 0 && focused_win < win_count) {
+            gui_window_t *fw = &windows[focused_win];
+            if (fw->visible && !fw->minimized && fw->is_user_win && fw->cursor_mode != 0) {
+                hide_cur = 1;
+            }
+        }
+        if (!hide_cur) {
+            vesa_draw_mouse_cursor(vbb, mouse_x, mouse_y);
+        }
+
+        vesa_flip();
+    } else {
+        uint32_t *dst = (uint32_t *)FB_ADDR;
+        uint32_t *src = (uint32_t *)backbuffer;
+        fast_memcpy_dw(dst, src, (SCREEN_W * SCREEN_H) / 4);
+    }
+}
+
+
 
 static void set_palette(void)
 {
@@ -191,7 +257,26 @@ static void set_palette(void)
     };
     for (int i = 0; i < 16; i++) {
         outb(0x3C9, cga[i][0]); outb(0x3C9, cga[i][1]); outb(0x3C9, cga[i][2]);
+        vesa_palette[i] = ARGB(0xFF, (cga[i][0] * 255) / 63, (cga[i][1] * 255) / 63, (cga[i][2] * 255) / 63);
     }
+    /* Override CGA entries with vibrant true-color values for VESA display */
+    vesa_palette[0]  = 0xFF000000; /* Black */
+    vesa_palette[1]  = 0xFF2563EB; /* Blue */
+    vesa_palette[2]  = 0xFF16A34A; /* Green */
+    vesa_palette[3]  = 0xFF0891B2; /* Cyan */
+    vesa_palette[4]  = 0xFFDC2626; /* Red */
+    vesa_palette[5]  = 0xFF9333EA; /* Magenta */
+    vesa_palette[6]  = 0xFFD97706; /* Brown/Amber */
+    vesa_palette[7]  = 0xFF9CA3AF; /* Light Gray */
+    vesa_palette[8]  = 0xFF4B5563; /* Dark Gray */
+    vesa_palette[9]  = 0xFF3B82F6; /* Bright Blue */
+    vesa_palette[10] = 0xFF22C55E; /* Bright Green */
+    vesa_palette[11] = 0xFF06B6D4; /* Bright Cyan */
+    vesa_palette[12] = 0xFFEF4444; /* Bright Red */
+    vesa_palette[13] = 0xFFD946EF; /* Bright Magenta */
+    vesa_palette[14] = 0xFFFFD700; /* Bright Yellow */
+    vesa_palette[15] = 0xFFF8FAFC; /* Bright White */
+
     for (int r = 0; r < 6; r++)
         for (int g = 0; g < 6; g++)
             for (int b = 0; b < 6; b++) {
@@ -199,15 +284,41 @@ static void set_palette(void)
                 uint8_t vg = (uint8_t)(g * 63 / 5);
                 uint8_t vb = (uint8_t)(b * 63 / 5);
                 outb(0x3C9, vr); outb(0x3C9, vg); outb(0x3C9, vb);
+                vesa_palette[16 + r*36 + g*6 + b] = ARGB(0xFF, (vr * 255) / 63, (vg * 255) / 63, (vb * 255) / 63);
             }
     for (int i = 0; i < 24; i++) {
         uint8_t v = (uint8_t)(i * 63 / 23);
         outb(0x3C9, v); outb(0x3C9, v); outb(0x3C9, v);
+        vesa_palette[232 + i] = ARGB(0xFF, (v * 255) / 63, (v * 255) / 63, (v * 255) / 63);
     }
 }
 
+#undef RGB
 #define RGB(r,g,b)  ((uint8_t)(16 + (r)*36 + (g)*6 + (b)))
 #define GRAY(n)     ((uint8_t)(232 + (n)))
+
+static inline uint8_t gui_rgb_to_vga(uint8_t r, uint8_t g, uint8_t b) {
+    int diff_rg = (r > g) ? (r - g) : (g - r);
+    int diff_gb = (g > b) ? (g - b) : (b - g);
+    int diff_rb = (r > b) ? (r - b) : (b - r);
+
+    if (diff_rg < 12 && diff_gb < 12 && diff_rb < 12) {
+        int avg = (r + g + b) / 3;
+        if (avg < 8) return 0;
+        if (avg > 248) return 15;
+        int gray_idx = (avg * 24) / 256;
+        if (gray_idx > 23) gray_idx = 23;
+        return (uint8_t)(232 + gray_idx);
+    }
+
+    uint8_t r6 = (uint8_t)((r * 5 + 128) / 255);
+    uint8_t g6 = (uint8_t)((g * 5 + 128) / 255);
+    uint8_t b6 = (uint8_t)((b * 5 + 128) / 255);
+    if (r6 > 5) r6 = 5;
+    if (g6 > 5) g6 = 5;
+    if (b6 > 5) b6 = 5;
+    return RGB(r6, g6, b6);
+}
 
 #define COL_BLACK      0
 #define COL_WHITE      15
@@ -244,9 +355,7 @@ static void rtc_read(uint8_t *h, uint8_t *m, uint8_t *s) {
     *s = sec; *m = min; *h = hour;
 }
 
-/* ============================================================
- * PRNG RANDOM NUMBER GENERATOR
- * ============================================================ */
+
 
 static uint32_t prng_state = 12345;
 
@@ -263,9 +372,7 @@ static uint32_t rand_next(void)
     return (prng_state / 65536) % 32768;
 }
 
-/* ============================================================
- * DRAWING PRIMITIVES (Render to Backbuffer)
- * ============================================================ */
+
 
 static inline void put_pixel(int x, int y, uint8_t color)
 {
@@ -294,9 +401,28 @@ void draw_rect(int x, int y, int w, int h, uint8_t color)
 void draw_hline(int x, int y, int w, uint8_t color)
 { for (int c = x; c < x+w; c++) put_pixel(c, y, color); }
 
-/* ============================================================
- * FULL ASCII 5x7 FONT
- * ============================================================ */
+void draw_vline(int x, int y, int h, uint8_t color)
+{ for (int r = y; r < y+h; r++) put_pixel(x, r, color); }
+
+void draw_line(int x0, int y0, int x1, int y1, uint8_t color)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = (dx > dy ? dx : -dy) / 2;
+    int e2;
+    while (1) {
+        put_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = err;
+        if (e2 > -dx) { err -= dy; x0 += sx; }
+        if (e2 <  dy) { err += dx; y0 += sy; }
+    }
+}
+
+
 
 static const uint8_t FONT[95][5] = {
     {0x00,0x00,0x00,0x00,0x00}, /* ' ' (32) */
@@ -485,49 +611,17 @@ __attribute__((unused)) static void str_cat(char *dst, const char *src, int max)
     str_cpy(dst + len, src, max - len);
 }
 
-/* ============================================================
- * PROGRAM SUITE & WINDOW MANAGEMENT
- * ============================================================ */
 
-typedef enum {
-    APP_CALC = 1,
-    APP_PAINTER,
-    APP_MINESWEEPER,
-    APP_FILEMAN,
-    APP_NOTEPAD,
-    APP_CPANEL,
-    APP_TASKMAN,
-    APP_IMGVIEW,
-    APP_SNAKE,
-    APP_CLI,
-    APP_CODESTUDIO,
-    APP_CONSOLE,
-    APP_BROWSER,
-    APP_AI_CHAT
-} app_type_t;
 
-typedef struct {
-    int x, y, w, h;
-    int saved_x, saved_y, saved_w, saved_h;
-    const char *title;
-    const char *short_title;
-    app_type_t app;
-    int visible;    /* 1: open, 0: closed */
-    int minimized;  /* 1: minimized to ProcessBar, 0: on desktop */
-    int focused;
-    int maximized;
-    int split_state;
-    uint32_t open_tick;  /* tick when window was opened (for open animation) */
-} gui_window_t;
+static int user_win_mouse_down = -1;
 
-#define MAX_WINDOWS 24
-static gui_window_t windows[MAX_WINDOWS];
-static int win_count = 0;
-static int focused_win = -1;
+void *gui_get_windows_addr(void)
+{
+    return (void *)windows;
+}
 
-/* ============================================================
- * TOAST / STATUS NOTIFICATION (replaces modal alert dialogs)
- * ============================================================ */
+
+
 #define TOAST_OK    0
 #define TOAST_ERR   1
 #define TOAST_INFO  2
@@ -558,8 +652,8 @@ static void gui_prompt_user_input(const char *prompt, char *out_buf, size_t max_
     out_buf[0] = '\0';
     int len = 0;
     int dlg_w = 210, dlg_h = 65;
-    int dlg_x = (80 * 8 - dlg_w) / 2;
-    int dlg_y = (25 * 16 - dlg_h) / 2;
+    int dlg_x = (SCREEN_W - dlg_w) / 2;
+    int dlg_y = (TASKBAR_Y - dlg_h) / 2;
     int shift_down = 0;
 
     irq_kbd_fired = 0;
@@ -584,11 +678,12 @@ static void gui_prompt_user_input(const char *prompt, char *out_buf, size_t max_
             if (cx < dlg_x + dlg_w - 14) fill_rect(cx, dlg_y + 37, 5, 7, COL_BLACK);
         }
 
-        draw_mouse_cursor(mouse_x, mouse_y);
+        if (!gui_vesa_active) draw_mouse_cursor(mouse_x, mouse_y);
         gui_flip();
         uint8_t kbd_status = inb(0x64);
         if (!irq_kbd_fired && (kbd_status & 0x01) && !(kbd_status & 0x20)) {
             last_scancode = inb(0x60);
+            keyboard_handle_scancode(last_scancode);
             irq_kbd_fired = 1;
         }
 
@@ -611,6 +706,7 @@ static void gui_prompt_user_input(const char *prompt, char *out_buf, size_t max_
         }
         pit_sleep(20);
     }
+    last_scancode = 0;
     irq_kbd_fired = 0;
     redraw_all_frame(mouse_x, mouse_y);
 }
@@ -626,14 +722,25 @@ static char calc_display[16] = "0";
 #define PAINT_CH 65
 static uint8_t paint_canvas[PAINT_CW * PAINT_CH];
 static uint8_t paint_color = COL_BLACK;
+typedef enum {
+    PTOOL_PENCIL = 0,
+    PTOOL_BRUSH  = 1,
+    PTOOL_ERASER = 2,
+    PTOOL_FILL   = 3,
+    PTOOL_LINE   = 4,
+    PTOOL_RECT   = 5,
+    PTOOL_BOX    = 6,
+    PTOOL_CIRCLE = 7,
+    PTOOL_PICKER = 8
+} ptool_t;
+static int paint_active_tool = PTOOL_PENCIL;
 static int paint_brush_size = 1; /* 1: Pencil (1px), 3: Brush (3px) */
 static int paint_eraser = 0;     /* 1: Eraser mode */
 static int paint_fill   = 0;     /* 1: Flood-fill mode */
 static int prev_paint_x = -1, prev_paint_y = -1;
+static int paint_shape_start_x = -1, paint_shape_start_y = -1;
 
-/* ============================================================
- * FLOOD FILL (BFS, iterative — no recursion = no stack overflow)
- * ============================================================ */
+
 #define FILL_STACK_CAP (PAINT_CW * PAINT_CH)
 static uint16_t fill_stack[FILL_STACK_CAP];  /* packed x|y */
 static void paint_flood_fill(int sx, int sy, uint8_t fill_col) {
@@ -661,9 +768,7 @@ static void paint_flood_fill(int sx, int sy, uint8_t fill_col) {
 static void sound_win(void);
 static void sound_lose(void);
 
-/* ============================================================
- * SNAKE GAME STATE
- * ============================================================ */
+
 #define SNAKE_GRID_W  22
 #define SNAKE_GRID_H  14
 #define SNAKE_CELL    6          /* px per cell */
@@ -729,9 +834,7 @@ static void snake_step(void) {
     else      snake_len = new_len;
 }
 
-/* ============================================================
- * SCREENSAVER STATE
- * ============================================================ */
+
 #define SAVER_IDLE_MS 25000    /* 25 seconds of idle → screensaver */
 static uint32_t last_activity_tick = 0;
 static int      screensaver_active = 0;
@@ -764,6 +867,48 @@ static void draw_paint_line(int x0, int y0, int x1, int y1, uint8_t color) {
         e2 = err;
         if (e2 > -dx) { err -= dy; x0 += sx; }
         if (e2 <  dy) { err += dx; y0 += sy; }
+    }
+}
+
+static void draw_paint_rect(int x0, int y0, int x1, int y1, uint8_t color, int filled) {
+    int min_x = x0 < x1 ? x0 : x1;
+    int max_x = x0 > x1 ? x0 : x1;
+    int min_y = y0 < y1 ? y0 : y1;
+    int max_y = y0 > y1 ? y0 : y1;
+    if (filled) {
+        for (int y = min_y; y <= max_y; y++) {
+            for (int x = min_x; x <= max_x; x++) {
+                draw_paint_spot(x, y, color);
+            }
+        }
+    } else {
+        for (int x = min_x; x <= max_x; x++) {
+            draw_paint_spot(x, min_y, color);
+            draw_paint_spot(x, max_y, color);
+        }
+        for (int y = min_y; y <= max_y; y++) {
+            draw_paint_spot(min_x, y, color);
+            draw_paint_spot(max_x, y, color);
+        }
+    }
+}
+
+static void draw_paint_circle(int xc, int yc, int r, uint8_t color) {
+    if (r <= 0) { draw_paint_spot(xc, yc, color); return; }
+    int x = 0, y = r;
+    int d = 3 - 2 * r;
+    while (y >= x) {
+        draw_paint_spot(xc + x, yc + y, color);
+        draw_paint_spot(xc - x, yc + y, color);
+        draw_paint_spot(xc + x, yc - y, color);
+        draw_paint_spot(xc - x, yc - y, color);
+        draw_paint_spot(xc + y, yc + x, color);
+        draw_paint_spot(xc - y, yc + x, color);
+        draw_paint_spot(xc + y, yc - x, color);
+        draw_paint_spot(xc - y, yc - x, color);
+        x++;
+        if (d > 0) { y--; d = d + 4 * (x - y) + 10; }
+        else d = d + 4 * x + 6;
     }
 }
 
@@ -825,13 +970,923 @@ static void minesweeper_reset(void)
 }
 
 /* Interactive Notepad State */
-static char notepad_buf[512] = "";
+#define NOTEPAD_BUF_MAX 4096
+static char notepad_buf[NOTEPAD_BUF_MAX] = "";
 static int notepad_len = 0;
+static int notepad_scroll = 0;
 static char notepad_filename[32] = "note.txt";
 
 /* Painter & Image Viewer File State */
 static char paint_filename[32] = "art.bmp";
 static char imgview_filename[32] = "art.bmp";
+
+#define IMGVIEW_BUF_W 160
+#define IMGVIEW_BUF_H 100
+static uint8_t imgview_pixels[IMGVIEW_BUF_W * IMGVIEW_BUF_H * 3];
+static int imgview_width = 0;
+static int imgview_height = 0;
+static int imgview_has_image = 0;
+
+typedef struct {
+    int x, y, w, h;
+    char name[32];
+    char value[64];
+    char placeholder[32];
+    int is_submit;
+    char onclick[128];
+} gui_input_t;
+
+#define BROWSER_FOCUS_NONE       -2
+#define BROWSER_FOCUS_URL        -1
+#define BROWSER_FOCUS_INPUT_BASE  0
+#define BROWSER_FOCUS_LINK_BASE   100
+
+#define MAX_BROWSER_TABS 4
+
+typedef struct {
+    char url[128];
+    char title[64];
+    char html[196608];
+    char history[16][128];
+    int  hist_count;
+    int  hist_pos;
+    int  scroll_y;
+    int  nav_focus;
+    int  input_focus;
+    int  is_loading;
+    uint8_t bg_color;
+} browser_tab_t;
+
+static browser_tab_t browser_tabs[MAX_BROWSER_TABS];
+static int browser_tab_count = 1;
+static int browser_active_tab = 0;
+
+
+
+#define V_MAP_X(wx) ((wx) * 800 / 320)
+#define V_MAP_Y(wy) ((wy) * 600 / 200)
+
+/* Strip one HTML tag from *p, advance past it, return tag name in tag_name */
+static void vesa_html_skip_tag(const char **p) {
+    if (**p != '<') return;
+    (*p)++;
+    while (**p && **p != '>') (*p)++;
+    if (**p == '>') (*p)++;
+}
+
+/* Check if tag at *p matches name (case-insensitive prefix match) */
+static int vesa_html_tag_is(const char *p, const char *name) {
+    if (*p != '<') return 0;
+    p++;
+    if (*p == '/') p++;
+    while (*name) {
+        char a = *p, b = *name;
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+        p++; name++;
+    }
+    return (*p == ' ' || *p == '>' || *p == '/');
+}
+
+
+/* Render browser HTML content at full VESA native resolution.
+ * cx,cy = content area top-left in VESA coords
+ * cw,ch = content area dimensions in VESA pixels
+ * Parses browser_html directly and lays out text/headings at native width */
+static void vesa_render_html_content(uint32_t *vbb, int cx, int cy, int cw, int ch, const char *html, int scroll_y_lines) {
+    /* html and scroll_y are passed in as parameters */
+    if (!vbb || !html || !html[0]) return;
+
+    /* Fill content background white */
+    for (int dy = cy; dy < cy + ch && dy < 600; dy++) {
+        for (int dx = cx; dx < cx + cw && dx < 800; dx++) {
+            vbb[dy * 800 + dx] = 0xFFFFFFFF;
+        }
+    }
+
+    const int GLYPH_W = 8;   /* font_draw_char_32 glyph width */
+    const int GLYPH_H = 8;   /* glyph height at scale 1 */
+    const int LINE_H  = 12;  /* line height with spacing */
+    const int H1_SCALE = 2;  /* headings at 2x scale = 16x16 */
+    const int H2_SCALE = 2;
+    const int MARGIN   = 8;  /* left margin */
+
+    int pen_x = cx + MARGIN;
+    int pen_y = cy + 8;
+    int max_x = cx + cw - MARGIN;
+    int scroll = scroll_y_lines * LINE_H;
+
+    /* Colors */
+    uint32_t col_text    = 0xFF1C1B22;
+    uint32_t col_heading = 0xFF0F172A;
+    uint32_t col_link    = 0xFF0284C7;
+    uint32_t col_h2      = 0xFF1E40AF;
+    uint32_t col_code    = 0xFF374151;
+    uint32_t cur_color   = col_text;
+    int cur_scale        = 1;
+    int in_pre           = 0;
+    int skip_content     = 0; /* skip script/style content */
+
+    /* Clip content to the content area, offset by scroll */
+    int render_top = cy;
+    int render_bot = cy + ch;
+
+    const char *p = html;
+
+    /* Fast-forward past <head> */
+    while (*p) {
+        if (*p == '<' && vesa_html_tag_is(p, "body")) { vesa_html_skip_tag(&p); break; }
+        if (*p == '<') vesa_html_skip_tag(&p); else p++;
+    }
+    if (!*p) { p = html; } /* no body tag — render everything */
+
+    while (*p) {
+        if (*p == '<') {
+            /* Determine tag type and update state */
+            if (vesa_html_tag_is(p, "h1")) {
+                cur_color = col_heading; cur_scale = H1_SCALE;
+                pen_x = cx + MARGIN;
+                /* newline if not at line start */
+                if (pen_y - scroll + (LINE_H * H1_SCALE) > render_bot) break;
+                pen_y += LINE_H;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "h2") || vesa_html_tag_is(p, "h3")) {
+                cur_color = col_h2; cur_scale = H2_SCALE;
+                pen_x = cx + MARGIN;
+                pen_y += LINE_H;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "/h1") || vesa_html_tag_is(p, "/h2") || vesa_html_tag_is(p, "/h3")) {
+                cur_color = col_text; cur_scale = 1;
+                pen_x = cx + MARGIN; pen_y += LINE_H * (cur_scale > 1 ? cur_scale : 1) + 2;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "p") || vesa_html_tag_is(p, "/p")) {
+                cur_color = col_text; cur_scale = 1;
+                pen_x = cx + MARGIN;
+                pen_y += LINE_H + 2;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "br")) {
+                pen_x = cx + MARGIN; pen_y += LINE_H;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "hr")) {
+                /* Draw a horizontal rule */
+                int ry = pen_y - scroll;
+                if (ry >= render_top && ry < render_bot) {
+                    for (int dx = cx + MARGIN; dx < cx + cw - MARGIN; dx++)
+                        vbb[ry * 800 + dx] = 0xFFCBD5E1;
+                }
+                pen_y += 4; pen_x = cx + MARGIN;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "a")) {
+                cur_color = col_link;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "/a")) {
+                cur_color = col_text;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "strong") || vesa_html_tag_is(p, "b")) {
+                cur_color = col_heading;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "/strong") || vesa_html_tag_is(p, "/b")) {
+                cur_color = col_text;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "code") || vesa_html_tag_is(p, "pre")) {
+                in_pre = 1; cur_color = col_code;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "/code") || vesa_html_tag_is(p, "/pre")) {
+                in_pre = 0; cur_color = col_text;
+                pen_x = cx + MARGIN; pen_y += 2;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "li")) {
+                pen_x = cx + MARGIN + 8; pen_y += LINE_H;
+                /* bullet point */
+                int by = pen_y - scroll;
+                if (by >= render_top && by < render_bot && pen_x - 6 + 3 < 800)
+                    vbb[by * 800 + pen_x - 6] = col_text;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "script") || vesa_html_tag_is(p, "style") || vesa_html_tag_is(p, "head")) {
+                skip_content = 1;
+                vesa_html_skip_tag(&p); continue;
+            } else if (vesa_html_tag_is(p, "/script") || vesa_html_tag_is(p, "/style") || vesa_html_tag_is(p, "/head")) {
+                skip_content = 0;
+                vesa_html_skip_tag(&p); continue;
+            } else {
+                vesa_html_skip_tag(&p); continue;
+            }
+        }
+
+        if (skip_content) { p++; continue; }
+
+        /* Render character */
+        char c = *p++;
+        if (c == '\n' || c == '\r') {
+            if (in_pre) { pen_x = cx + MARGIN; pen_y += LINE_H; }
+            continue;
+        }
+        if (c == '\t') { pen_x += GLYPH_W * 4 * cur_scale; continue; }
+        if (c == ' ') {
+            pen_x += GLYPH_W * cur_scale;
+            if (pen_x >= max_x) { pen_x = cx + MARGIN; pen_y += LINE_H * cur_scale; }
+            continue;
+        }
+        if (c < ' ' || c > '~') continue;
+
+        /* Word-wrap: if this char would overflow, newline first */
+        if (pen_x + GLYPH_W * cur_scale > max_x) {
+            pen_x = cx + MARGIN;
+            pen_y += LINE_H * cur_scale;
+        }
+
+        /* Early-out if way past scroll */
+        if (pen_y - scroll > render_bot + LINE_H * 4) break;
+
+        /* Draw glyph if in visible region (accounting for scroll) */
+        int draw_y = pen_y - scroll;
+        if (draw_y >= render_top && draw_y + GLYPH_H * cur_scale <= render_bot) {
+            if (cur_scale == 1) {
+                font_draw_char_32(vbb, 800, 600, pen_x, draw_y, c, cur_color);
+            } else {
+                /* Manual 2x scale using font_get_glyph */
+                const uint8_t *glyph = font_get_glyph(FONT_STYLE_CLASSIC, c);
+                if (glyph) {
+                    for (int gy = 0; gy < 8; gy++) {
+                        uint8_t row = glyph[gy];
+                        for (int gx = 0; gx < 8; gx++) {
+                            if (row & (0x80 >> gx)) {
+                                int bx = pen_x + gx * 2;
+                                int by = draw_y + gy * 2;
+                                if (bx + 1 < 800 && by + 1 < 600) {
+                                    vbb[by * 800 + bx]         = cur_color;
+                                    vbb[by * 800 + bx + 1]     = cur_color;
+                                    vbb[(by+1) * 800 + bx]     = cur_color;
+                                    vbb[(by+1) * 800 + bx + 1] = cur_color;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pen_x += GLYPH_W * cur_scale;
+    }
+
+    /* Draw a thin right-side scrollbar */
+    int sb_x = cx + cw - 6;
+    for (int dy = cy; dy < cy + ch && dy < 600; dy++)
+        vbb[dy * 800 + sb_x] = 0xFFCBD5E1;
+}
+
+/* Render notepad content at full VESA resolution */
+static void vesa_render_notepad_content(uint32_t *vbb, int cx, int cy, int cw, int ch) {
+    if (!vbb) return;
+
+    /* White text canvas */
+    for (int dy = cy; dy < cy + ch && dy < 600; dy++)
+        for (int dx = cx; dx < cx + cw && dx < 800; dx++)
+            vbb[dy * 800 + dx] = 0xFFFFFFFF;
+
+    const int GLYPH_W = 8, LINE_H = 12, MARGIN = 6;
+    int pen_x = cx + MARGIN, pen_y = cy + 6;
+    int max_x = cx + cw - MARGIN;
+    int skip_lines = notepad_scroll;
+    int line_num = 0;
+
+    for (int i = 0; i < notepad_len && pen_y < cy + ch; i++) {
+        char c = notepad_buf[i];
+        if (c == '\n') {
+            line_num++;
+            pen_x = cx + MARGIN;
+            if (line_num >= skip_lines) pen_y += LINE_H;
+            continue;
+        }
+        if (line_num < skip_lines) continue;
+        if (pen_x + GLYPH_W > max_x) {
+            pen_x = cx + MARGIN; pen_y += LINE_H;
+            if (pen_y >= cy + ch) break;
+        }
+        if (pen_y >= cy && pen_y + 8 <= cy + ch)
+            font_draw_char_32(vbb, 800, 600, pen_x, pen_y, c, 0xFF1C1B22);
+        pen_x += GLYPH_W;
+    }
+}
+
+/* Render image viewer content at full VESA resolution */
+static void vesa_render_imgview_content(uint32_t *vbb, int cx, int cy, int cw, int ch) {
+    if (!vbb || !imgview_has_image || imgview_width <= 0 || imgview_height <= 0) return;
+
+    /* Dark background */
+    for (int dy = cy; dy < cy + ch && dy < 600; dy++)
+        for (int dx = cx; dx < cx + cw && dx < 800; dx++)
+            vbb[dy * 800 + dx] = 0xFF1A1A2E;
+
+    /* Scale image to fit content area, preserving aspect ratio */
+    int scale_x = cw / imgview_width;
+    int scale_y = ch / imgview_height;
+    int scale   = (scale_x < scale_y) ? scale_x : scale_y;
+    if (scale < 1) scale = 1;
+    if (scale > 4) scale = 4;
+
+    int img_w = imgview_width  * scale;
+    int img_h = imgview_height * scale;
+    int off_x = cx + (cw - img_w) / 2;
+    int off_y = cy + (ch - img_h) / 2;
+
+    for (int sy = 0; sy < imgview_height; sy++) {
+        for (int sx = 0; sx < imgview_width; sx++) {
+            int pidx = (sy * imgview_width + sx) * 3;
+            uint32_t r = imgview_pixels[pidx];
+            uint32_t g = imgview_pixels[pidx + 1];
+            uint32_t b = imgview_pixels[pidx + 2];
+            uint32_t col = 0xFF000000 | (r << 16) | (g << 8) | b;
+            for (int dy2 = 0; dy2 < scale; dy2++) {
+                for (int dx2 = 0; dx2 < scale; dx2++) {
+                    int fx = off_x + sx * scale + dx2;
+                    int fy = off_y + sy * scale + dy2;
+                    if (fx >= 0 && fx < 800 && fy >= 0 && fy < 600)
+                        vbb[fy * 800 + fx] = col;
+                }
+            }
+        }
+    }
+}
+
+static int coreview_gui_tab = 0;       /* 0: CPU, 1: RAM, 2: GPU */
+static uint32_t coreview_gui_ram_addr = 0x00B33380; /* Active kernel tick/data section */
+
+static void vesa_cv_draw_str(uint32_t *vbb, int x, int y, const char *s, uint32_t color) {
+    if (!vbb || !s) return;
+    for (int i = 0; s[i]; i++) {
+        font_draw_char_32(vbb, 800, 600, x + i * 8, y, s[i], color);
+    }
+}
+
+static void vesa_cv_fill_rect(uint32_t *vbb, int rx, int ry, int rw, int rh, uint32_t color) {
+    if (!vbb) return;
+    for (int y = ry; y < ry + rh && y < 600; y++) {
+        if (y < 0) continue;
+        for (int x = rx; x < rx + rw && x < 800; x++) {
+            if (x < 0) continue;
+            vbb[y * 800 + x] = color;
+        }
+    }
+}
+
+static void vesa_cv_draw_rect(uint32_t *vbb, int rx, int ry, int rw, int rh, uint32_t color) {
+    if (!vbb) return;
+    for (int x = rx; x < rx + rw && x < 800; x++) {
+        if (x >= 0 && ry >= 0 && ry < 600) vbb[ry * 800 + x] = color;
+        if (x >= 0 && ry + rh - 1 >= 0 && ry + rh - 1 < 600) vbb[(ry + rh - 1) * 800 + x] = color;
+    }
+    for (int y = ry; y < ry + rh && y < 600; y++) {
+        if (y >= 0 && rx >= 0 && rx < 800) vbb[y * 800 + rx] = color;
+        if (y >= 0 && rx + rw - 1 >= 0 && rx + rw - 1 < 800) vbb[y * 800 + (rx + rw - 1)] = color;
+    }
+}
+
+static void vesa_render_coreview_content(uint32_t *vbb, int cx, int cy, int cw, int ch, gui_window_t *w) {
+    if (!vbb || cw <= 0 || ch <= 0) return;
+
+    /* Live hardware sampling for real-time telemetry */
+    coreview_sample_hardware();
+    coreview_waterfall_step(coreview_gui_ram_addr);
+
+    /* Fill background in rich obsidian navy */
+    vesa_cv_fill_rect(vbb, cx, cy, cw, ch, 0xFF070C18);
+
+    /* --- Interactive Tab Switcher [1: CPU Regs] [2: RAM Water] [3: GPU Engine] --- */
+    int tab_w = (cw - 16) / 3;
+    if (tab_w < 1) tab_w = 1;
+    const char *tab_titles[3] = { "1: CPU Regs", "2: RAM Water", "3: GPU Engine" };
+    for (int t = 0; t < 3; t++) {
+        int tx = cx + 8 + t * tab_w;
+        int ty = cy + 4;
+        if (t == coreview_gui_tab) {
+            vesa_cv_fill_rect(vbb, tx, ty, tab_w - 4, 18, 0xFF2563EB);
+            vesa_cv_draw_rect(vbb, tx, ty, tab_w - 4, 18, 0xFFFFFFFF);
+            vesa_cv_draw_str(vbb, tx + (tab_w - 4 - 11 * 8) / 2, ty + 5, tab_titles[t], 0xFFFFFFFF);
+        } else {
+            vesa_cv_fill_rect(vbb, tx, ty, tab_w - 4, 18, 0xFF1E293B);
+            vesa_cv_draw_rect(vbb, tx, ty, tab_w - 4, 18, 0xFF475569);
+            vesa_cv_draw_str(vbb, tx + (tab_w - 4 - 11 * 8) / 2, ty + 5, tab_titles[t], 0xFF94A3B8);
+        }
+    }
+
+    /* --- Interactive Activity Spectrum Bar (0 to 9) --- */
+    int cur_lvl = coreview_get_active_level();
+    const char *lvl_pills[10] = {
+        "0:Cold", "1:CR3", "2:Code", "3:IO", "4:Heap",
+        "5:Stack", "6:GUI", "7:Mouse", "8:TCB", "9:IRQ0"
+    };
+    int pill_w = 62;
+    int pill_gap = 3;
+    int pills_start_x = cx + (cw - (10 * pill_w + 9 * pill_gap)) / 2;
+    if (pills_start_x < cx + 4) pills_start_x = cx + 4;
+
+    for (int l = 0; l < 10; l++) {
+        int bx = pills_start_x + l * (pill_w + pill_gap);
+        int by = cy + 26;
+        const coreview_activity_tier_t *tier = coreview_get_activity_tier(l);
+        uint32_t tcol = tier->color;
+
+        if (l == cur_lvl) {
+            vesa_cv_fill_rect(vbb, bx, by, pill_w, 18, tcol);
+            vesa_cv_draw_rect(vbb, bx - 1, by - 1, pill_w + 2, 20, 0xFFFFFFFF);
+            vesa_cv_draw_str(vbb, bx + 5, by + 4, lvl_pills[l], 0xFFFFFFFF);
+        } else {
+            vesa_cv_fill_rect(vbb, bx, by, pill_w, 18, 0xFF141E33);
+            vesa_cv_draw_rect(vbb, bx, by, pill_w, 18, tcol);
+            vesa_cv_draw_str(vbb, bx + 5, by + 4, lvl_pills[l], tcol);
+        }
+    }
+
+    /* Subheader with Tier Info */
+    const coreview_activity_tier_t *cur_tier = coreview_get_activity_tier(cur_lvl);
+    char infostr[96] = "Activity Spectrum: Rank ";
+    infostr[24] = '0' + cur_lvl;
+    infostr[25] = ' '; infostr[26] = '[';
+    int sidx = 27;
+    const char *tname = cur_tier->name;
+    while (*tname && sidx < 48) infostr[sidx++] = *tname++;
+    infostr[sidx++] = ']'; infostr[sidx++] = ' ';
+    infostr[sidx++] = '~';
+    char hzstr[8]; itoa(cur_tier->est_hz, hzstr, 10);
+    int hzi = 0; while (hzstr[hzi]) infostr[sidx++] = hzstr[hzi++];
+    const char *hzend = " Hz Target  |  Base: 0x";
+    while (*hzend) infostr[sidx++] = *hzend++;
+    for (int k = 7; k >= 0; k--) { infostr[sidx++] = "0123456789ABCDEF"[(coreview_gui_ram_addr >> (k * 4)) & 0xF]; }
+    infostr[sidx] = '\0';
+    vesa_cv_draw_str(vbb, cx + 8, cy + 48, infostr, 0xFF38BDF8);
+
+    int cy_body = cy + 66;
+
+    if (coreview_gui_tab == 0) {
+        /* TAB 0: CPU Registers + Disassembly */
+        int col1_x = cx + 8;
+        int col2_x = cx + (cw / 2) + 4;
+
+        for (int r = 0; r < 6; r++) {
+            int r1 = r;
+            int r2 = r + 6;
+            int row_y = cy_body + 4 + r * 22;
+
+            /* Col 1 */
+            const char *rn1 = coreview_get_reg_name(r1);
+            vesa_cv_draw_str(vbb, col1_x, row_y, rn1, 0xFF00E0FF);
+            font_draw_char_32(vbb, 800, 600, col1_x + 28, row_y, ':', 0xFF888888);
+
+            char hval1[12] = "0x";
+            uint32_t v1 = coreview_get_reg_val(r1);
+            for (int k = 7; k >= 0; k--) { hval1[2 + 7 - k] = "0123456789ABCDEF"[(v1 >> (k * 4)) & 0xF]; }
+            hval1[10] = '\0';
+            vesa_cv_draw_str(vbb, col1_x + 38, row_y, hval1, 0xFFFFFFFF);
+
+            /* Rank Badge Col 1 */
+            uint8_t rk1 = coreview_get_reg_rank(r1);
+            uint16_t hz1 = coreview_get_reg_hz(r1);
+            char rkstr1[14] = "R";
+            rkstr1[1] = '0' + rk1; rkstr1[2] = ':';
+            char hz1s[8]; itoa(hz1, hz1s, 10);
+            int hi1 = 0; while (hz1s[hi1] && hi1 < 4) { rkstr1[3 + hi1] = hz1s[hi1]; hi1++; }
+            rkstr1[3 + hi1] = 'H'; rkstr1[4 + hi1] = 'z'; rkstr1[5 + hi1] = '\0';
+            uint32_t rkcol1 = (rk1 >= 8) ? 0xFFEF4444 : (rk1 >= 5) ? 0xFFF59E0B : (rk1 >= 2) ? 0xFF10B981 : 0xFF64748B;
+            vesa_cv_draw_str(vbb, col1_x + 124, row_y, rkstr1, rkcol1);
+
+            /* Binary bit pips for r1 */
+            int bx = col1_x + 185;
+            for (int b = 31; b >= 0; b--) {
+                uint32_t col;
+                if (coreview_get_bit_pulse(r1, b) > 0) {
+                    col = 0xFFFFB000; /* Gold pulse */
+                } else if (v1 & (1U << b)) {
+                    col = 0xFF00FF66; /* Vibrant Lime */
+                } else {
+                    col = 0xFF1C2A3A; /* Dim Navy */
+                }
+                for (int py = row_y + 1; py < row_y + 10; py++) {
+                    for (int px = bx; px < bx + 2; px++) {
+                        if (px < 800 && py < 600) vbb[py * 800 + px] = col;
+                    }
+                }
+                bx += 3;
+                if (b % 8 == 0) bx += 2;
+            }
+
+            /* Col 2 */
+            const char *rn2 = coreview_get_reg_name(r2);
+            vesa_cv_draw_str(vbb, col2_x, row_y, rn2, 0xFF00E0FF);
+            font_draw_char_32(vbb, 800, 600, col2_x + 28, row_y, ':', 0xFF888888);
+
+            char hval2[12] = "0x";
+            uint32_t v2 = coreview_get_reg_val(r2);
+            for (int k = 7; k >= 0; k--) { hval2[2 + 7 - k] = "0123456789ABCDEF"[(v2 >> (k * 4)) & 0xF]; }
+            hval2[10] = '\0';
+            vesa_cv_draw_str(vbb, col2_x + 38, row_y, hval2, 0xFFFFFFFF);
+
+            /* Rank Badge Col 2 */
+            uint8_t rk2 = coreview_get_reg_rank(r2);
+            uint16_t hz2 = coreview_get_reg_hz(r2);
+            char rkstr2[14] = "R";
+            rkstr2[1] = '0' + rk2; rkstr2[2] = ':';
+            char hz2s[8]; itoa(hz2, hz2s, 10);
+            int hi2 = 0; while (hz2s[hi2] && hi2 < 4) { rkstr2[3 + hi2] = hz2s[hi2]; hi2++; }
+            rkstr2[3 + hi2] = 'H'; rkstr2[4 + hi2] = 'z'; rkstr2[5 + hi2] = '\0';
+            uint32_t rkcol2 = (rk2 >= 8) ? 0xFFEF4444 : (rk2 >= 5) ? 0xFFF59E0B : (rk2 >= 2) ? 0xFF10B981 : 0xFF64748B;
+            vesa_cv_draw_str(vbb, col2_x + 124, row_y, rkstr2, rkcol2);
+
+            /* Binary bit pips for r2 */
+            bx = col2_x + 185;
+            for (int b = 31; b >= 0; b--) {
+                uint32_t col;
+                if (coreview_get_bit_pulse(r2, b) > 0) {
+                    col = 0xFFFFB000;
+                } else if (v2 & (1U << b)) {
+                    col = 0xFF00FF66;
+                } else {
+                    col = 0xFF1C2A3A;
+                }
+                for (int py = row_y + 1; py < row_y + 10; py++) {
+                    for (int px = bx; px < bx + 2; px++) {
+                        if (px < 800 && py < 600) vbb[py * 800 + px] = col;
+                    }
+                }
+                bx += 3;
+                if (b % 8 == 0) bx += 2;
+            }
+        }
+
+        /* Disassembly panel at bottom */
+        int dasm_y = cy_body + 144;
+        vesa_cv_fill_rect(vbb, cx + 6, dasm_y, cw - 12, 130, 0xFF0F172A);
+        vesa_cv_draw_rect(vbb, cx + 6, dasm_y, cw - 12, 130, 0xFF38BDF8);
+
+        const char *dhdr = coreview_is_paused() ? "--- CS:EIP Real-Time Instruction Stream [PAUSED] ---" : "--- CS:EIP Real-Time Instruction Stream [LIVE 30FPS] ---";
+        uint32_t hdr_col = coreview_is_paused() ? 0xFFFFD700 : 0xFF38BDF8;
+        vesa_cv_draw_str(vbb, cx + 12, dasm_y + 6, dhdr, hdr_col);
+
+        uint32_t curr_eip = coreview_get_cpu()->eip;
+        for (int d = 0; d < 4; d++) {
+            char bytes[16];
+            char asmtxt[48];
+            int len = coreview_disasm_at(curr_eip, bytes, asmtxt, sizeof(asmtxt));
+            int dy = dasm_y + 24 + d * 22;
+
+            if (d == 0) {
+                font_draw_char_32(vbb, 800, 600, cx + 12, dy, '=', 0xFFFFD700);
+                font_draw_char_32(vbb, 800, 600, cx + 20, dy, '>', 0xFFFFD700);
+            }
+
+            char abuf[12] = "0x";
+            for (int k = 7; k >= 0; k--) { abuf[2 + 7 - k] = "0123456789ABCDEF"[(curr_eip >> (k * 4)) & 0xF]; }
+            abuf[10] = '\0';
+            vesa_cv_draw_str(vbb, cx + 32, dy, abuf, 0xFF94A3B8);
+            vesa_cv_draw_str(vbb, cx + 130, dy, bytes, 0xFF64748B);
+
+            uint32_t tcol = (d == 0) ? 0xFFFFFFFF : 0xFF38BDF8;
+            vesa_cv_draw_str(vbb, cx + 220, dy, asmtxt, tcol);
+
+            curr_eip += len;
+        }
+    } else if (coreview_gui_tab == 1) {
+        /* TAB 1: RAM Waterfall */
+        char abuf[36] = "Memory Waterfall: 0x";
+        for (int k = 7; k >= 0; k--) { abuf[20 + 7 - k] = "0123456789ABCDEF"[(coreview_gui_ram_addr >> (k * 4)) & 0xF]; }
+        abuf[28] = '\0';
+        vesa_cv_draw_str(vbb, cx + 8, cy_body + 4, abuf, 0xFF34D399);
+
+        /* Interactive Prev/Next and Preset buttons */
+        int pbx = V_MAP_X(w->x + 110);
+        int pbw = V_MAP_X(32);
+        int nbx = V_MAP_X(w->x + 146);
+        int nbw = V_MAP_X(32);
+        int dbx = V_MAP_X(w->x + 182);
+        int dbw = V_MAP_X(26);
+        int cbx = V_MAP_X(w->x + 212);
+        int cbw = V_MAP_X(26);
+        int sbx = V_MAP_X(w->x + 242);
+        int sbw = V_MAP_X(24);
+
+        int btns[5] = { pbx, nbx, dbx, cbx, sbx };
+        int btnw[5] = { pbw, nbw, dbw, cbw, sbw };
+        const char *blbls[5] = { "< Prev", "Next >", "Ticks", "Code", "Stack" };
+        uint32_t bcols[5] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFD700, 0xFF00E0FF, 0xFFFFFFFF };
+
+        for (int b = 0; b < 5; b++) {
+            int bx0 = btns[b], bw0 = btnw[b];
+            for (int by = cy_body; by < cy_body + 18; by++) {
+                for (int bx = bx0; bx < bx0 + bw0 && bx < 800; bx++) {
+                    vbb[by * 800 + bx] = (by == cy_body || by == cy_body + 17 || bx == bx0 || bx == bx0 + bw0 - 1) ? 0xFF64748B : 0xFF1E293B;
+                }
+            }
+            const char *lbl = blbls[b];
+            int llen = 0; while (lbl[llen]) llen++;
+            int tx = bx0 + (bw0 - llen * 8) / 2;
+            vesa_cv_draw_str(vbb, tx, cy_body + 5, lbl, bcols[b]);
+        }
+
+        const uint8_t *wdata = coreview_waterfall_get_data();
+        const uint8_t *wheat = coreview_waterfall_get_heat();
+
+        for (int r = 0; r < 8; r++) {
+            int ry = cy_body + 26 + r * 22;
+            char off[12] = "0x";
+            uint32_t row_addr = coreview_gui_ram_addr + r * 16;
+            for (int k = 7; k >= 0; k--) { off[2 + 7 - k] = "0123456789ABCDEF"[(row_addr >> (k * 4)) & 0xF]; }
+            off[10] = ':'; off[11] = '\0';
+            vesa_cv_draw_str(vbb, cx + 8, ry, off, 0xFF64748B);
+
+            /* Hex columns */
+            for (int c = 0; c < 16; c++) {
+                int idx = r * 16 + c;
+                char hb[3];
+                hb[0] = "0123456789ABCDEF"[(wdata[idx] >> 4) & 0xF];
+                hb[1] = "0123456789ABCDEF"[wdata[idx] & 0xF];
+                hb[2] = '\0';
+
+                uint32_t col;
+                if (wheat[idx] > 180) col = 0xFFFFFFFF;
+                else if (wheat[idx] > 80) col = 0xFFFFD700;
+                else if (wdata[idx] > 0) col = 0xFF38BDF8;
+                else col = 0xFF334155;
+
+                font_draw_char_32(vbb, 800, 600, cx + 115 + c * 24, ry, hb[0], col);
+                font_draw_char_32(vbb, 800, 600, cx + 115 + c * 24 + 8, ry, hb[1], col);
+            }
+
+            /* ASCII column */
+            for (int c = 0; c < 16; c++) {
+                int idx = r * 16 + c;
+                char ch = (char)wdata[idx];
+                if (ch < 32 || ch > 126) ch = '.';
+                uint32_t col = (wheat[idx] > 80) ? 0xFFFFD700 : 0xFFCBD5E1;
+                font_draw_char_32(vbb, 800, 600, cx + 515 + c * 9, ry, ch, col);
+            }
+        }
+    } else {
+        /* TAB 2: GPU Engine & Oscilloscope */
+        coreview_gpu_t gpu;
+        coreview_sample_gpu(&gpu);
+
+        /* --- Panel 1: Hardware Identity & Compositor Performance Card --- */
+        vesa_cv_fill_rect(vbb, cx + 6, cy_body, cw - 12, 38, 0xFF0F172A);
+        vesa_cv_draw_rect(vbb, cx + 6, cy_body, cw - 12, 38, 0xFF38BDF8);
+
+        vesa_cv_draw_str(vbb, cx + 12, cy_body + 4, "Architecture: Bochs/QEMU BGA v5 (PCI 1234:1111) | Mode: 800x600 @ 32 bpp True-Color", 0xFF00E0FF);
+
+        char metstr[96] = "VRAM: 0xFD000000 (16 MB) | Pitch: 3200B | FPS: ";
+        int mi = 48;
+        char fps_s[8]; itoa(gpu.fps, fps_s, 10);
+        int fi = 0; while (fps_s[fi]) metstr[mi++] = fps_s[fi++];
+        const char *m_ft = " | Time: ";
+        while (*m_ft) metstr[mi++] = *m_ft++;
+        char ft_s[8]; itoa(gpu.frame_time_ms, ft_s, 10);
+        fi = 0; while (ft_s[fi]) metstr[mi++] = ft_s[fi++];
+        const char *m_bw = " ms | Throughput: ";
+        while (*m_bw) metstr[mi++] = *m_bw++;
+        char bw_s[8]; itoa(gpu.vram_bandwidth_mb, bw_s, 10);
+        fi = 0; while (bw_s[fi]) metstr[mi++] = bw_s[fi++];
+        const char *m_end = " MB/s";
+        while (*m_end) metstr[mi++] = *m_end++;
+        metstr[mi] = '\0';
+        vesa_cv_draw_str(vbb, cx + 12, cy_body + 20, metstr, 0xFF94A3B8);
+
+        /* --- Panel 2: Dual-Trace Oscilloscope & Phosphor Radar --- */
+        int scope_y = cy_body + 44;
+        int scope_w = 370;
+        int scope_h = 126;
+
+        /* Oscilloscope Screen Box */
+        vesa_cv_fill_rect(vbb, cx + 6, scope_y, scope_w, scope_h, 0xFF051515);
+        vesa_cv_draw_rect(vbb, cx + 6, scope_y, scope_w, scope_h, 0xFF00F0FF);
+
+        /* Reticle grid lines */
+        for (int gx = cx + 6 + 37; gx < cx + 6 + scope_w; gx += 37) {
+            for (int gy = scope_y; gy < scope_y + scope_h; gy += 4) {
+                vbb[gy * 800 + gx] = 0xFF0B2929;
+            }
+        }
+        for (int gy = scope_y + 21; gy < scope_y + scope_h; gy += 21) {
+            for (int gx = cx + 6; gx < cx + 6 + scope_w; gx += 4) {
+                vbb[gy * 800 + gx] = 0xFF0B2929;
+            }
+        }
+
+        /* Trace 1: HSync Analog Pulse (top half of scope, mid-line y = scope_y + 35) */
+        vesa_cv_draw_str(vbb, cx + 12, scope_y + 4, "CH1: H-Sync Pulse & Active Video", 0xFF00F0FF);
+        int ch1_mid = scope_y + 35;
+        int h_beam_px = (gpu.beam_x * scope_w) / 800;
+        for (int x = 0; x < scope_w - 4; x++) {
+            int wave_y;
+            if (x < 30) wave_y = ch1_mid + 15; /* H-Sync dip */
+            else if (x < 50) wave_y = ch1_mid; /* Back porch */
+            else if (x < scope_w - 40) wave_y = ch1_mid - 12 + ((x * 7) % 5); /* Active video waveform */
+            else wave_y = ch1_mid; /* Front porch */
+
+            int py = wave_y;
+            int px = cx + 8 + x;
+            if (px < 800 && py >= scope_y && py < scope_y + scope_h) {
+                vbb[py * 800 + px] = 0xFF00F0FF;
+                vbb[(py + 1) * 800 + px] = 0xFF00F0FF;
+            }
+        }
+        /* Live sweep indicator dot on Trace 1 */
+        int dot1_x = cx + 8 + h_beam_px;
+        if (dot1_x >= cx + 8 && dot1_x < cx + 6 + scope_w) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    int py = ch1_mid + dy;
+                    int px = dot1_x + dx;
+                    if (px < 800 && py >= scope_y && py < scope_y + scope_h)
+                        vbb[py * 800 + px] = 0xFFFFFFFF;
+                }
+            }
+        }
+
+        /* Trace 2: VSync Deflection Ramp (bottom half of scope, mid-line y = scope_y + 85) */
+        vesa_cv_draw_str(vbb, cx + 12, scope_y + 65, "CH2: V-Deflection Sawtooth (60 Hz)", 0xFF00FF66);
+        int v_beam_px = (gpu.scanline * scope_w) / 600;
+        int ch2_base = scope_y + 115;
+        for (int x = 0; x < scope_w - 4; x++) {
+            int ramp_h = (x * 35) / scope_w;
+            int py = ch2_base - ramp_h;
+            int px = cx + 8 + x;
+            if (px < 800 && py >= scope_y && py < scope_y + scope_h) {
+                vbb[py * 800 + px] = 0xFF00FF66;
+                vbb[(py + 1) * 800 + px] = 0xFF00FF66;
+            }
+        }
+        /* Live sweep indicator dot on Trace 2 */
+        int dot2_x = cx + 8 + v_beam_px;
+        if (dot2_x >= cx + 8 && dot2_x < cx + 6 + scope_w) {
+            int py = ch2_base - (v_beam_px * 35) / scope_w;
+            for (int dy = -3; dy <= 3; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    int ny = py + dy;
+                    int nx = dot2_x + dx;
+                    if (nx < 800 && ny >= scope_y && ny < scope_y + scope_h)
+                        vbb[ny * 800 + nx] = 0xFFFFFFFF;
+                }
+            }
+        }
+
+        /* 2D CRT Phosphor Raster Target & Beam Radar (Right Side) */
+        int crt_x = cx + 386;
+        int crt_w = cw - 394;
+        int crt_h = scope_h;
+        vesa_cv_fill_rect(vbb, crt_x, scope_y, crt_w, crt_h, 0xFF0A0F1D);
+        vesa_cv_draw_rect(vbb, crt_x, scope_y, crt_w, crt_h, 0xFF38BDF8);
+
+        vesa_cv_draw_str(vbb, crt_x + 8, scope_y + 6, "2D Cathode Ray Beam Target", 0xFFFFD700);
+
+        /* Screen miniature box */
+        int smini_x = crt_x + 8;
+        int smini_y = scope_y + 22;
+        int smini_w = crt_w - 16;
+        int smini_h = 55;
+        vesa_cv_fill_rect(vbb, smini_x, smini_y, smini_w, smini_h, 0xFF051510);
+        vesa_cv_draw_rect(vbb, smini_x, smini_y, smini_w, smini_h, 0xFF10B981);
+
+        /* Electron Gun Dot inside mini box */
+        int gun_x = smini_x + (gpu.beam_x * smini_w) / 800;
+        int gun_y = smini_y + (gpu.scanline * smini_h) / 600;
+
+        /* Phosphor decay trail */
+        for (int tx = gun_x - 15; tx < gun_x; tx++) {
+            if (tx >= smini_x && tx < smini_x + smini_w) {
+                vbb[gun_y * 800 + tx] = 0xFF064E3B;
+            }
+        }
+
+        /* Beam Core Dot */
+        for (int dy = -2; dy <= 2; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                int px = gun_x + dx;
+                int py = gun_y + dy;
+                if (px >= smini_x && px < smini_x + smini_w && py >= smini_y && py < smini_y + smini_h) {
+                    vbb[py * 800 + px] = (dx == 0 && dy == 0) ? 0xFFFFFFFF : 0xFF00FF66;
+                }
+            }
+        }
+
+        /* Readouts below mini box */
+        char posstr[40] = "Beam: X:";
+        char bx_s[8]; itoa(gpu.beam_x, bx_s, 10);
+        int bi = 8; int xi = 0; while (bx_s[xi]) posstr[bi++] = bx_s[xi++];
+        const char *ps_y = "  Y:";
+        while (*ps_y) posstr[bi++] = *ps_y++;
+        char by_s[8]; itoa(gpu.scanline, by_s, 10);
+        xi = 0; while (by_s[xi]) posstr[bi++] = by_s[xi++];
+        posstr[bi] = '\0';
+        vesa_cv_draw_str(vbb, crt_x + 8, scope_y + 84, posstr, 0xFFFFFFFF);
+
+        const char *rst = gpu.vblank ? "[ VBLANK RETRACE ACTIVE ]" : "[ ACTIVE RASTER SCAN ]";
+        uint32_t rst_col = gpu.vblank ? 0xFFEF4444 : 0xFF10B981;
+        vesa_cv_draw_str(vbb, crt_x + 8, scope_y + 102, rst, rst_col);
+
+        /* --- Panel 3: Silicon Register Matrix (Bottom) --- */
+        int mat_y = scope_y + scope_h + 8;
+        int mat_h = 105;
+        vesa_cv_fill_rect(vbb, cx + 6, mat_y, cw - 12, mat_h, 0xFF0B132B);
+        vesa_cv_draw_rect(vbb, cx + 6, mat_y, cw - 12, mat_h, 0xFF1E3A8A);
+
+        /* Col 1: CRTC Registers (Index 00-12) */
+        vesa_cv_draw_str(vbb, cx + 12, mat_y + 6, "CRTC Subsystem (0x3D4):", 0xFF38BDF8);
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 4; col++) {
+                int reg_i = row * 4 + col;
+                int rx = cx + 12 + col * 50;
+                int ry = mat_y + 24 + row * 22;
+                char rlbl[8];
+                rlbl[0] = '[';
+                rlbl[1] = "0123456789ABCDEF"[(reg_i >> 4) & 0xF];
+                rlbl[2] = "0123456789ABCDEF"[reg_i & 0xF];
+                rlbl[3] = ']'; rlbl[4] = ':'; rlbl[5] = '\0';
+                vesa_cv_draw_str(vbb, rx, ry, rlbl, 0xFF64748B);
+                char rv[3];
+                rv[0] = "0123456789ABCDEF"[(gpu.crtc[reg_i] >> 4) & 0xF];
+                rv[1] = "0123456789ABCDEF"[gpu.crtc[reg_i] & 0xF];
+                rv[2] = '\0';
+                vesa_cv_draw_str(vbb, rx + 26, ry, rv, 0xFFFFFFFF);
+            }
+        }
+
+        /* Col 2: Sequencer & Graphics Controller */
+        int col2_rx = cx + 225;
+        vesa_cv_draw_str(vbb, col2_rx, mat_y + 6, "Sequencer & Graphics:", 0xFF10B981);
+        vesa_cv_draw_str(vbb, col2_rx, mat_y + 24, "SR01: 01 (Clock Mode)", 0xFFCBD5E1);
+        vesa_cv_draw_str(vbb, col2_rx, mat_y + 46, "SR02: 0F (Plane Mask)", 0xFFCBD5E1);
+        vesa_cv_draw_str(vbb, col2_rx, mat_y + 68, "GR05: 00 (Write Mode)", 0xFFCBD5E1);
+
+        /* Col 3: Bochs BGA Extension */
+        int col3_rx = cx + 425;
+        vesa_cv_draw_str(vbb, col3_rx, mat_y + 6, "BGA DISPI Extension:", 0xFFFFD700);
+        vesa_cv_draw_str(vbb, col3_rx, mat_y + 24, "ID: 0xB0C5  RES: 800x600", 0xFFCBD5E1);
+        vesa_cv_draw_str(vbb, col3_rx, mat_y + 46, "BPP: 32  ENABLE: 0x41(LFB)", 0xFFCBD5E1);
+        vesa_cv_draw_str(vbb, col3_rx, mat_y + 68, "VRAM: 16.0 MB Dedicated", 0xFFCBD5E1);
+    }
+}
+
+/* Master overlay: re-render the focused window's content at native VESA resolution */
+static void vesa_render_active_window(uint32_t *vbb) {
+    if (!vbb || focused_win < 0 || focused_win >= win_count) return;
+    gui_window_t *w = &windows[focused_win];
+    if (!w->visible || w->minimized) return;
+
+    /* Map window content area from 320x200 canvas to 800x600 VESA */
+    int content_canvas_y;
+    switch (w->app) {
+        case APP_BROWSER:  content_canvas_y = w->y + 50; break; /* tab+nav+bm bars */
+        case APP_NOTEPAD:  content_canvas_y = w->y + 30; break;
+        case APP_IMGVIEW:  content_canvas_y = w->y + 14; break;
+        case APP_COREVIEW: content_canvas_y = w->y + 14; break;
+        case APP_USER_WIN:
+            if (w->user_canvas32) { content_canvas_y = w->y + 12; break; }
+            return;
+        default: return; /* other apps: no native VESA overlay */
+    }
+
+    int cx = V_MAP_X(w->x + 1);
+    int cy = V_MAP_Y(content_canvas_y);
+    int cw = V_MAP_X(w->x + w->w - 1) - cx;
+    int ch = V_MAP_Y(w->y + w->h - 1) - cy;
+
+    /* Bounds check */
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    if (cx + cw > 800) cw = 800 - cx;
+    if (cy + ch > 600) ch = 600 - cy;
+    if (cw <= 0 || ch <= 0) return;
+
+    switch (w->app) {
+        case APP_BROWSER: {
+            browser_tab_t *bt = &browser_tabs[browser_active_tab];
+            vesa_render_html_content(vbb, cx, cy, cw, ch,
+                bt->html, bt->scroll_y);
+            break;
+        }
+        case APP_NOTEPAD: vesa_render_notepad_content(vbb, cx, cy, cw, ch); break;
+        case APP_IMGVIEW: vesa_render_imgview_content(vbb, cx, cy, cw, ch); break;
+        case APP_COREVIEW: vesa_render_coreview_content(vbb, cx, cy, cw, ch, w); break;
+        case APP_USER_WIN: {
+            if (w->user_canvas32 && w->user_canvas32_w > 0 && w->user_canvas32_h > 0) {
+                for (int dy = 0; dy < ch; dy++) {
+                    int sy = (dy * w->user_canvas32_h) / ch;
+                    if (sy >= w->user_canvas32_h) sy = w->user_canvas32_h - 1;
+                    const uint32_t *s = w->user_canvas32 + sy * w->user_canvas32_w;
+                    uint32_t *d = vbb + (cy + dy) * 800 + cx;
+                    for (int dx = 0; dx < cw; dx++) {
+                        int sx = (dx * w->user_canvas32_w) / cw;
+                        if (sx >= w->user_canvas32_w) sx = w->user_canvas32_w - 1;
+                        d[dx] = s[sx];
+                    }
+                }
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+
+
 
 /* File Manager State */
 static fs_node_t *fileman_cur_dir = NULL;
@@ -844,7 +1899,7 @@ static void sound_win_open(void);
 static void sound_win_close(void);
 static void sound_win(void);
 static void sound_lose(void);
-static void sound_tone(uint32_t freq_hz, uint32_t ms);
+void sound_tone(uint32_t freq_hz, uint32_t ms);
 static void sound_error(void);
 static void sound_clear(void);
 static void sound_open(void);
@@ -853,7 +1908,7 @@ static void open_window(int idx);
 /* 7x7 Pixel Program Icons */
 static void draw_app_icon(int x, int y, app_type_t app)
 {
-    static const uint8_t ICONS[16][7][7] = {
+    static const uint8_t ICONS[17][7][7] = {
         /* Calc */
         { {1,1,1,1,1,1,1},{1,0,0,0,0,0,1},{1,0,1,0,1,0,1},{1,0,0,0,0,0,1},{1,0,1,0,1,0,1},{1,0,0,0,0,0,1},{1,1,1,1,1,1,1} },
         /* Painter */
@@ -885,7 +1940,9 @@ static void draw_app_icon(int x, int y, app_type_t app)
         /* Video Player (Film & Play) */
         { {1,1,1,1,1,1,1},{1,0,1,0,1,0,1},{1,1,1,1,1,1,1},{1,0,1,0,0,0,1},{1,0,1,1,0,0,1},{1,0,1,0,0,0,1},{1,1,1,1,1,1,1} },
         /* AI Assistant (Chat Spark) */
-        { {0,1,1,1,1,1,0},{1,1,0,1,0,1,1},{1,0,1,1,1,0,1},{1,0,0,1,0,0,1},{1,1,1,1,1,1,1},{1,1,0,0,0,0,0},{1,0,0,0,0,0,0} }
+        { {0,1,1,1,1,1,0},{1,1,0,1,0,1,1},{1,0,1,1,1,0,1},{1,0,0,1,0,0,1},{1,1,1,1,1,1,1},{1,1,0,0,0,0,0},{1,0,0,0,0,0,0} },
+        /* CoreView (Silicon Microchip) */
+        { {0,1,0,1,0,1,0},{1,1,1,1,1,1,1},{0,1,0,0,0,1,0},{1,1,0,1,0,1,1},{0,1,0,0,0,1,0},{1,1,1,1,1,1,1},{0,1,0,1,0,1,0} }
     };
 
     uint8_t fg = COL_BLACK;
@@ -901,14 +1958,49 @@ static void draw_app_icon(int x, int y, app_type_t app)
     else if (app == APP_CODESTUDIO) fg = COL_CYAN;
     else if (app == APP_CONSOLE) fg = COL_LIME;
     else if (app == APP_BROWSER) fg = COL_CYAN;
-    else if (app == APP_AI_CHAT)     fg = COL_LIME;
+    else if (app == APP_COREVIEW)    fg = COL_CYAN;
+
+    if (app == APP_USER_WIN) {
+        static const uint8_t USER_ICON[7][7] = {
+            {1,1,1,1,1,1,1},
+            {1,0,0,0,0,0,1},
+            {1,1,1,1,1,1,1},
+            {1,0,1,0,1,0,1},
+            {1,0,0,0,0,0,1},
+            {1,0,1,1,1,0,1},
+            {1,1,1,1,1,1,1}
+        };
+        for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 7; c++)
+                if (USER_ICON[r][c]) put_pixel(x + c, y + r, COL_CYAN);
+        return;
+    }
 
     int idx = (int)app - 1;
-    if (idx < 0 || idx >= 16) return;
+    if (idx < 0 || idx >= 17) return;
 
     for (int r = 0; r < 7; r++)
         for (int c = 0; c < 7; c++)
             if (ICONS[idx][r][c]) put_pixel(x + c, y + r, fg);
+}
+
+static void draw_window_icon(int x, int y, int win_idx)
+{
+    if (win_idx >= 0 && win_idx < MAX_WINDOWS) {
+        gui_window_t *w = &windows[win_idx];
+        if (w->is_user_win && w->has_custom_icon) {
+            uint8_t fg = w->custom_icon_color ? w->custom_icon_color : COL_CYAN;
+            for (int r = 0; r < 7; r++) {
+                for (int c = 0; c < 7; c++) {
+                    if (w->custom_icon[r][c]) {
+                        put_pixel(x + c, y + r, fg);
+                    }
+                }
+            }
+            return;
+        }
+        draw_app_icon(x, y, w->app);
+    }
 }
 
 /* System Configuration file `archaos.conf` Parsing */
@@ -939,26 +2031,62 @@ static void save_archaos_conf(void) {
     fs_write("archaos.conf", buf, 3);
 }
 
+static void init_builtin_win(int idx, int x, int y, int w, int h, const char *title, const char *short_title, app_type_t app)
+{
+    windows[idx].x = x; windows[idx].y = y; windows[idx].w = w; windows[idx].h = h;
+    windows[idx].saved_x = x; windows[idx].saved_y = y; windows[idx].saved_w = w; windows[idx].saved_h = h;
+    windows[idx].title = title;
+    windows[idx].short_title = short_title;
+    windows[idx].app = app;
+    windows[idx].visible = 0;
+    windows[idx].minimized = 0;
+    windows[idx].focused = 0;
+    windows[idx].maximized = 0;
+    windows[idx].split_state = 0;
+    windows[idx].open_tick = 0;
+    windows[idx].user_canvas = NULL;
+    windows[idx].user_canvas32 = NULL;
+    windows[idx].user_canvas32_w = 0;
+    windows[idx].user_canvas32_h = 0;
+    windows[idx].is_user_win = 0;
+    windows[idx].event_head = 0;
+    windows[idx].event_tail = 0;
+}
+
 static void win_init_all(void)
 {
     win_count = 0;
 
-    windows[0] = (gui_window_t){ 15, 15, 110, 115, 15, 15, 110, 115, "Calculator", "Calc", APP_CALC, 0, 0, 0, 0, 0, 0 };
-    windows[1] = (gui_window_t){ 135, 15, 165, 105, 135, 15, 165, 105, "Painter", "Painter", APP_PAINTER, 0, 0, 0, 0, 0, 0 };
-    windows[2] = (gui_window_t){ 15, 65, 110, 105, 15, 65, 110, 105, "Minesweeper", "Mine", APP_MINESWEEPER, 0, 0, 0, 0, 0, 0 };
-    windows[3] = (gui_window_t){ 130, 50, 150, 110, 130, 50, 150, 110, "File Manager", "Files", APP_FILEMAN, 0, 0, 0, 0, 0, 0 };
-    windows[4] = (gui_window_t){ 35, 30, 150, 110, 35, 30, 150, 110, "Notepad", "Notepad", APP_NOTEPAD, 0, 0, 0, 0, 0, 0 };
-    windows[5] = (gui_window_t){ 150, 25, 145, 115, 150, 25, 145, 115, "Control Panel", "CPanel", APP_CPANEL, 0, 0, 0, 0, 0, 0 };
-    windows[6] = (gui_window_t){ 40, 20, 160, 135, 40, 20, 160, 135, "Task Manager", "TaskMan", APP_TASKMAN, 0, 0, 0, 0, 0, 0 };
-    windows[7] = (gui_window_t){ 120, 35, 155, 120, 120, 35, 155, 120, "Image Viewer", "ImgView", APP_IMGVIEW, 0, 0, 0, 0, 0, 0 };
-    windows[8]  = (gui_window_t){ 60,  20, 160, 120, 60,  20, 160, 120, "Snake",        "Snake",     APP_SNAKE,      0, 0, 0, 0, 0, 0 };
-    windows[9]  = (gui_window_t){ 15,  12, 290, 168, 15,  12, 290, 168, "Terminal",     "CLI",       APP_CLI,        0, 0, 0, 0, 0, 0 };
-    windows[10] = (gui_window_t){ 35,  10, 245, 145, 35,  10, 245, 145, "App Studio",   "AppStudio", APP_CODESTUDIO, 0, 0, 0, 0, 0, 0 };
-    windows[11] = (gui_window_t){ 70,  30, 180, 130, 70,  30, 180, 130, "App Output",   "Console",   APP_CONSOLE,    0, 0, 0, 0, 0, 0 };
-    windows[12] = (gui_window_t){ 4,   14, 312, 172, 4,   14, 312, 172, "Web Browser",  "Browser",   APP_BROWSER,    0, 0, 0, 0, 0, 0 };
-    windows[13] = (gui_window_t){ 36,  18, 220, 148, 36,  18, 220, 148, "AI Assistant", "AI Chat",   APP_AI_CHAT,    0, 0, 0, 0, 0, 0 };
+    init_builtin_win(0, 15, 15, 110, 115, "Calculator", "Calc", APP_CALC);
+    init_builtin_win(1, 135, 15, 165, 105, "Painter", "Painter", APP_PAINTER);
+    init_builtin_win(2, 15, 65, 110, 105, "Minesweeper", "Mine", APP_MINESWEEPER);
+    init_builtin_win(3, 130, 50, 150, 110, "File Manager", "Files", APP_FILEMAN);
+    init_builtin_win(4, 35, 30, 150, 110, "Notepad", "Notepad", APP_NOTEPAD);
+    init_builtin_win(5, 150, 25, 145, 115, "Control Panel", "CPanel", APP_CPANEL);
+    init_builtin_win(6, 40, 20, 160, 135, "Task Manager", "TaskMan", APP_TASKMAN);
+    init_builtin_win(7, 120, 35, 155, 120, "Image Viewer", "ImgView", APP_IMGVIEW);
+    init_builtin_win(8, 60,  20, 160, 120, "Snake",        "Snake",     APP_SNAKE);
+    init_builtin_win(9, 15,  12, 290, 168, "Terminal",     "CLI",       APP_CLI);
+    init_builtin_win(10, 35, 10, 245, 145, "App Studio",   "AppStudio", APP_CODESTUDIO);
+    init_builtin_win(11, 70, 30, 180, 130, "App Output",   "Console",   APP_CONSOLE);
+    init_builtin_win(12, 4,  14, 312, 172, "Web Browser",  "Browser",   APP_BROWSER);
+    init_builtin_win(13, 25, 15, 270, 160, "CoreView: Silicon Monitor", "Core", APP_COREVIEW);
 
     win_count = 14;
+    for (int i = 14; i < MAX_WINDOWS; i++) {
+        windows[i].visible = 0;
+        windows[i].minimized = 0;
+        windows[i].focused = 0;
+        windows[i].maximized = 0;
+        windows[i].split_state = 0;
+        windows[i].user_canvas = NULL;
+        windows[i].user_canvas32 = NULL;
+        windows[i].user_canvas32_w = 0;
+        windows[i].user_canvas32_h = 0;
+        windows[i].is_user_win = 0;
+        windows[i].event_head = 0;
+        windows[i].event_tail = 0;
+    }
     focused_win = -1;
     fileman_cur_dir = fs_root();
     load_archaos_conf();
@@ -971,9 +2099,7 @@ static void win_init_all(void)
 
 #include "net/js/js_engine.h"
 
-/* ============================================================
- * WEB BROWSER APP — Graphical Mode 13h Web Browser & JS Engine
- * ============================================================ */
+
 static char gui_to_lower(char c) {
     if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
     return c;
@@ -1054,39 +2180,7 @@ typedef struct {
     char onclick[128];
 } gui_link_t;
 
-typedef struct {
-    int x, y, w, h;
-    char name[32];
-    char value[64];
-    char placeholder[32];
-    int is_submit;
-    char onclick[128];
-} gui_input_t;
 
-#define BROWSER_FOCUS_NONE       -2
-#define BROWSER_FOCUS_URL        -1
-#define BROWSER_FOCUS_INPUT_BASE  0
-#define BROWSER_FOCUS_LINK_BASE   100
-
-#define MAX_BROWSER_TABS 4
-
-typedef struct {
-    char url[128];
-    char title[64];
-    char html[196608];
-    char history[16][128];
-    int  hist_count;
-    int  hist_pos;
-    int  scroll_y;
-    int  nav_focus;
-    int  input_focus;
-    int  is_loading;
-    uint8_t bg_color;
-} browser_tab_t;
-
-static browser_tab_t browser_tabs[MAX_BROWSER_TABS];
-static int browser_tab_count = 1;
-static int browser_active_tab = 0;
 static char browser_status[48] = "Ready";
 static int  browser_url_focus = 0;
 static int  browser_url_cursor = 0;
@@ -1898,9 +2992,7 @@ static void draw_browser(gui_window_t *w)
     draw_str(w->x + 6, sb_y + 2, browser_status, COL_BLACK, GRAY(20));
 }
 
-/* ============================================================
- * DRAW APP CONTENTS
- * ============================================================ */
+
 
 static void draw_calculator(gui_window_t *w)
 {
@@ -1924,14 +3016,7 @@ static void draw_calculator(gui_window_t *w)
         }
 }
 
-/* ============================================================
- * PAINTER — Fully Dynamic, Window-Size-Aware
- *
- * Layout (relative to window):
- *   Toolbar:  y+13..y+23   (10px tall, action buttons left, color swatches right)
- *   Canvas:   y+25..y+h-14 (fills the window body)
- *   Status:   y+h-12..y+h  (filename + current tool)
- * ============================================================ */
+
 
 /* Returns the painter canvas rect in screen coords given the window */
 static void paint_canvas_rect(gui_window_t *w, int *cx, int *cy, int *cw, int *ch) {
@@ -1958,30 +3043,27 @@ static void draw_painter(gui_window_t *w)
     /* ---- Toolbar Background ---- */
     fill_rect(w->x + 2, toolbar_y, w->w - 4, 11, GRAY(16));
 
-    /* Tool buttons: Clr Sav Opn | Pnc Bsh Ers Fil */
-    static const char *tbtns[7] = { "Clr","Sav","Opn","Pnc","Bsh","Ers","Fil" };
+    /* Action buttons: Clr Sav Opn */
+    static const char *fbtns[3] = { "Clr", "Sav", "Opn" };
     for (int i = 0; i < 3; i++) {
-        int bx = w->x + 4 + i * 26;
-        fill_rect(bx, toolbar_y + 1, 24, 9, GRAY(20));
-        draw_rect(bx, toolbar_y + 1, 24, 9, GRAY(8));
-        draw_str(bx + 2, toolbar_y + 2, tbtns[i], COL_BLACK, GRAY(20));
+        int bx = w->x + 4 + i * 18;
+        fill_rect(bx, toolbar_y + 1, 16, 9, GRAY(20));
+        draw_rect(bx, toolbar_y + 1, 16, 9, GRAY(8));
+        draw_str(bx + 1, toolbar_y + 2, fbtns[i], COL_BLACK, GRAY(20));
     }
     /* Separator */
-    for (int dy=0; dy<9; dy++) put_pixel(w->x + 82, toolbar_y + 1 + dy, GRAY(8));
+    for (int dy = 0; dy < 9; dy++) put_pixel(w->x + 59, toolbar_y + 1 + dy, GRAY(8));
 
-    int tool_sel_pnc = (paint_brush_size == 1 && !paint_eraser && !paint_fill);
-    int tool_sel_bsh = (paint_brush_size == 3 && !paint_eraser && !paint_fill);
-    int tool_sel_ers = paint_eraser;
-    int tool_sel_fil = paint_fill;
-
-    int tbx[4] = { w->x + 85, w->x + 111, w->x + 137, w->x + 163 };
-    int tact[4] = { tool_sel_pnc, tool_sel_bsh, tool_sel_ers, tool_sel_fil };
-    for (int i = 0; i < 4; i++) {
-        if (tbx[i] + 24 > w->x + w->w - 2) break;
-        uint8_t bg = tact[i] ? GRAY(10) : GRAY(20);
-        fill_rect(tbx[i], toolbar_y + 1, 24, 9, bg);
-        draw_rect(tbx[i], toolbar_y + 1, 24, 9, tact[i] ? COL_TEAL : GRAY(8));
-        draw_str(tbx[i] + 2, toolbar_y + 2, tbtns[3 + i], COL_BLACK, bg);
+    /* 9 Geometric & Drawing Tools: Pn, Bs, Er, Fl, Ln, Rc, Bx, Cr, Ey */
+    static const char *tbtns[9] = { "Pn","Bs","Er","Fl","Ln","Rc","Bx","Cr","Ey" };
+    for (int i = 0; i < 9; i++) {
+        int bx = w->x + 62 + i * 11;
+        if (bx + 10 > w->x + w->w - 2) break;
+        int active = (paint_active_tool == i);
+        uint8_t bg = active ? GRAY(10) : GRAY(20);
+        fill_rect(bx, toolbar_y + 1, 10, 9, bg);
+        draw_rect(bx, toolbar_y + 1, 10, 9, active ? COL_TEAL : GRAY(8));
+        draw_str(bx + 1, toolbar_y + 2, tbtns[i], active ? COL_WHITE : COL_BLACK, bg);
     }
 
     /* ---- Canvas ---- */
@@ -2118,138 +3200,52 @@ static void draw_notepad(gui_window_t *w)
     fill_rect(tx, ty, tw, th, COL_WHITE);
     draw_rect(tx, ty, tw, th, COL_BLACK);
 
-    /* Render Notepad Text */
+    /* Render Notepad Text with Vertical Scroll Support */
     int cur_x = tx + 4, cur_y = ty + 4;
+    int line_num = 0;
+    int visible_lines = (th - 8) / 9;
+    if (visible_lines < 1) visible_lines = 1;
+
     for (int i = 0; i < notepad_len; i++) {
         char ch = notepad_buf[i];
         if (ch == '\n') {
+            line_num++;
             cur_x = tx + 4;
-            cur_y += 9;
-            if (cur_y > ty + th - 10) break;
-        } else {
-            draw_char(cur_x, cur_y, ch, COL_BLACK, COL_WHITE);
-            cur_x += 6;
-            if (cur_x > tx + tw - 8) {
-                cur_x = tx + 4;
+            if (line_num >= notepad_scroll) {
                 cur_y += 9;
                 if (cur_y > ty + th - 10) break;
+            }
+        } else {
+            if (line_num >= notepad_scroll && cur_y <= ty + th - 10) {
+                draw_char(cur_x, cur_y, ch, COL_BLACK, COL_WHITE);
+            }
+            cur_x += 6;
+            if (cur_x > tx + tw - 12) {
+                line_num++;
+                cur_x = tx + 4;
+                if (line_num >= notepad_scroll) {
+                    cur_y += 9;
+                    if (cur_y > ty + th - 10) break;
+                }
             }
         }
     }
 
+    /* Scrollbar indicator if text exceeds visible canvas */
+    if (line_num > visible_lines) {
+        int sb_x = tx + tw - 5;
+        fill_rect(sb_x, ty + 1, 1, th - 2, GRAY(12));
+        int thumb_h = (visible_lines * (th - 4)) / (line_num + 1);
+        if (thumb_h < 6) thumb_h = 6;
+        int max_scroll = line_num - visible_lines + 1;
+        if (max_scroll < 1) max_scroll = 1;
+        int thumb_y = ty + 2 + (notepad_scroll * (th - 4 - thumb_h)) / max_scroll;
+        fill_rect(sb_x - 1, thumb_y, 4, thumb_h, COL_BLUE);
+    }
+
     /* Cursor */
-    if ((pit_ticks() / 500) % 2 == 0 && w->focused) {
+    if ((pit_ticks() / 500) % 2 == 0 && w->focused && cur_y <= ty + th - 10) {
         fill_rect(cur_x, cur_y, 5, 7, COL_BLACK);
-    }
-}
-
-/* ============================================================
- * AI ASSISTANT CHAT APPLICATION (APP_AI_CHAT)
- * ============================================================ */
-static char ai_chat_input[128] = "";
-static int  ai_chat_input_len = 0;
-static char ai_chat_status[48] = "Ready";
-
-static void ai_chat_send_message(void) {
-    if (ai_chat_input_len == 0) return;
-    char prompt[128];
-    str_cpy(prompt, ai_chat_input, sizeof(prompt));
-    ai_chat_input[0] = '\0';
-    ai_chat_input_len = 0;
-
-    str_cpy(ai_chat_status, "Thinking...", sizeof(ai_chat_status));
-    sound_click();
-    redraw_all_frame(mouse_x, mouse_y);
-
-    int online_ok = 0;
-    if (net_if.up) {
-        static char ai_resp[4096];
-        if (nim_query(prompt, ai_resp, sizeof(ai_resp)) && ai_resp[0]) {
-            str_cpy(ai_chat_status, "Ready", sizeof(ai_chat_status));
-            sound_tone(523, 20);
-            online_ok = 1;
-        }
-    }
-    if (!online_ok) {
-        char resp[128];
-        ai_get_response(prompt, resp, sizeof(resp));
-        nim_history_add("user", prompt);
-        nim_history_add("assistant", resp);
-        str_cpy(ai_chat_status, "Ready (Offline)", sizeof(ai_chat_status));
-        sound_tone(523, 20);
-    }
-}
-
-static void draw_ai_chat(gui_window_t *w)
-{
-    fill_rect(w->x + 1, w->y + 12, w->w - 2, w->h - 13, GRAY(4));
-
-    /* Header Bar */
-    char hdr[64];
-    snprintf(hdr, sizeof(hdr), "ArchaOS AI Copilot [%s]", ai_chat_status);
-    draw_str_clip(w->x + 6, w->y + 14, hdr, COL_WHITE, GRAY(4), w->x + w->w - 6);
-
-    /* Chat Transcript View */
-    int tx = w->x + 5, ty = w->y + 24, tw = w->w - 10, th = w->h - 44;
-    fill_rect(tx, ty, tw, th, RGB(0, 0, 1));
-    draw_rect(tx, ty, tw, th, GRAY(8));
-
-    int hist_cnt = nim_history_count();
-    if (hist_cnt == 0) {
-        draw_str(tx + 8, ty + 12, "AI Assistant initialized.", GRAY(14), RGB(0, 0, 1));
-        draw_str(tx + 8, ty + 24, "Type a question below to chat.", GRAY(10), RGB(0, 0, 1));
-        draw_str(tx + 8, ty + 36, "Context is remembered across turns!", COL_CYAN, RGB(0, 0, 1));
-    } else {
-        int cur_y = ty + 4;
-        int start_h = (hist_cnt > 6) ? hist_cnt - 6 : 0;
-        for (int i = start_h; i < hist_cnt && cur_y + 10 < ty + th; i++) {
-            const nim_message_t *m = nim_history_get(i);
-            if (!m) continue;
-            int is_user = (m->role[0] == 'u');
-            uint8_t badge_col = is_user ? COL_CYAN : COL_LIME;
-            draw_str(tx + 4, cur_y, is_user ? "You:" : "AI:", badge_col, RGB(0, 0, 1));
-            draw_str_clip(tx + 30, cur_y, m->content, is_user ? COL_WHITE : GRAY(18), RGB(0, 0, 1), tx + tw - 6);
-            cur_y += 12;
-        }
-    }
-
-    /* Input Bar */
-    int iy = w->y + w->h - 17;
-    int iw = w->w - 75;
-    fill_rect(tx, iy, iw, 12, COL_WHITE);
-    draw_rect(tx, iy, iw, 12, COL_BLACK);
-    draw_str_clip(tx + 3, iy + 2, ai_chat_input, COL_BLACK, COL_WHITE, tx + iw - 8);
-
-    /* Blinking cursor */
-    if ((pit_ticks() / 500) % 2 == 0 && w->focused) {
-        int cx = tx + 3 + str_len(ai_chat_input) * 6;
-        if (cx < tx + iw - 6) fill_rect(cx, iy + 2, 4, 8, COL_BLUE);
-    }
-
-    /* [Send] Button */
-    fill_rect(tx + iw + 2, iy, 34, 12, COL_BLUE);
-    draw_rect(tx + iw + 2, iy, 34, 12, GRAY(2));
-    draw_str(tx + iw + 5, iy + 2, "Send", COL_WHITE, COL_BLUE);
-
-    /* [Clr] Button */
-    fill_rect(tx + iw + 38, iy, 26, 12, GRAY(14));
-    draw_rect(tx + iw + 38, iy, 26, 12, GRAY(2));
-    draw_str(tx + iw + 41, iy + 2, "Clr", COL_BLACK, GRAY(14));
-}
-
-static void handle_ai_chat_click(gui_window_t *w, int mx, int my) {
-    int tx = w->x + 5;
-    int iy = w->y + w->h - 17;
-    int iw = w->w - 75;
-
-    /* Send Button */
-    if (mx >= tx + iw + 2 && mx <= tx + iw + 36 && my >= iy && my <= iy + 12) {
-        ai_chat_send_message();
-    }
-    /* Clear Button */
-    else if (mx >= tx + iw + 38 && mx <= tx + iw + 64 && my >= iy && my <= iy + 12) {
-        nim_history_clear();
-        sound_clear();
     }
 }
 
@@ -2346,19 +3342,13 @@ static void draw_cpanel(gui_window_t *w)
     }
 }
 
-/* ============================================================
- * PC SPEAKER UI SOUND EFFECTS
- * ============================================================ */
 
-static void sound_tone(uint32_t freq_hz, uint32_t ms) {
+
+void sound_tone(uint32_t freq_hz, uint32_t ms) {
     if (freq_hz == 0) return;
-    uint32_t div = 1193180 / freq_hz;
-    outb(0x43, 0xB6);
-    outb(0x42, (uint8_t)(div & 0xFF));
-    outb(0x42, (uint8_t)((div >> 8) & 0xFF));
-    outb(0x61, inb(0x61) | 3);
+    audio_play_freq(freq_hz);
     pit_sleep(ms);
-    outb(0x61, inb(0x61) & ~3);
+    audio_play_freq(0);
 }
 
 static void sound_click(void)    { sound_tone(900,  4); }
@@ -2423,9 +3413,7 @@ static void draw_taskman(gui_window_t *w)
     }
 }
 
-/* ============================================================
- * IMAGE VIEWER — Full Controls + Synthwave Landscape
- * ============================================================ */
+
 static void draw_imgview(gui_window_t *w)
 {
     /* Toolbar: [Prev] [Next] [Zoom+] [Zoom-] [Clr] */
@@ -2457,13 +3445,28 @@ static void draw_imgview(gui_window_t *w)
 
     int ix = cx + 1, iy = cy + 1, iw = cw - 2, ih = ch - 2;
 
-    /* Check if we have canvas data; if so, render it scaled */
-    int has_data = 0;
+    /* Check if we have decoded image data; if so, render it centered & scaled */
+    int has_canvas_data = 0;
     for (int k = 0; k < PAINT_CW * PAINT_CH; k++) {
-        if (paint_canvas[k] != COL_WHITE) { has_data = 1; break; }
+        if (paint_canvas[k] != COL_WHITE) { has_canvas_data = 1; break; }
     }
 
-    if (has_data) {
+    if (imgview_has_image && imgview_width > 0 && imgview_height > 0) {
+        /* Render decoded true-color image scaled and centered */
+        for (int row = 0; row < ih; row++) {
+            int src_y = (row * imgview_height) / ih;
+            if (src_y >= imgview_height) src_y = imgview_height - 1;
+            for (int col = 0; col < iw; col++) {
+                int src_x = (col * imgview_width) / iw;
+                if (src_x >= imgview_width) src_x = imgview_width - 1;
+                int idx = (src_y * imgview_width + src_x) * 3;
+                uint8_t r = imgview_pixels[idx + 0];
+                uint8_t g = imgview_pixels[idx + 1];
+                uint8_t b = imgview_pixels[idx + 2];
+                put_pixel(ix + col, iy + row, gui_rgb_to_vga(r, g, b));
+            }
+        }
+    } else if (has_canvas_data) {
         /* Scale-blit the paint canvas into the viewer */
         for (int row = 0; row < ih; row++) {
             int src_row = (row * PAINT_CH) / ih;
@@ -2534,9 +3537,7 @@ static void draw_imgview(gui_window_t *w)
     draw_str_clip(w->x + 8, w->y + w->h - 11, imgview_filename, COL_WHITE, GRAY(6), w->x + w->w - 8);
 }
 
-/* ============================================================
- * DRAW SNAKE
- * ============================================================ */
+
 static void draw_snake(gui_window_t *w)
 {
     int avail_w = w->w - 8;
@@ -2584,9 +3585,7 @@ static void draw_snake(gui_window_t *w)
     }
 }
 
-/* ============================================================
- * TERMINAL / CLI APP STATE
- * ============================================================ */
+
 #define CLI_LINES_MAX 128
 #define CLI_LINE_LEN  80
 static char    cli_lines[CLI_LINES_MAX][CLI_LINE_LEN];
@@ -2763,9 +3762,7 @@ static void draw_cli(gui_window_t *w)
     }
 }
 
-/* ============================================================
- * APP STUDIO / CODEABLE APPS STATE (ArchaOS, Python, C)
- * ============================================================ */
+
 #define CODE_MAX_LINES 32
 #define CODE_LINE_MAX_LEN 128
 static char code_lines[CODE_MAX_LINES][CODE_LINE_MAX_LEN];
@@ -2816,9 +3813,7 @@ static int var_get_int(const char *name) {
     return mini_atoi(name);
 }
 
-/* ============================================================
- * STRING VARIABLE SUPPORT
- * ============================================================ */
+
 
 static void var_set_str(const char *name, const char *val) {
     for (int i = 0; i < env_var_cnt; i++) {
@@ -2848,10 +3843,7 @@ static const char *var_get_str(const char *name) {
 
 static void console_add_line(const char *text);
 
-/* ============================================================
- * EXPRESSION EVALUATOR — recursive descent parser
- * Precedence (low to high): or, and, not, comparison, +/-, *, /, %, unary-, atom
- * ============================================================ */
+
 
 static const char *expr_ws(const char *p) {
     while (*p == ' ' || *p == '\t') p++;
@@ -2867,6 +3859,25 @@ static int expr_is_alnum(char c) {
 static int expr_is_digit(char c) { return c >= '0' && c <= '9'; }
 
 static int eval_expr_full(const char **pp);
+
+#define MAX_CFUNCS 16
+#define MAX_CFUNC_PARAMS 4
+#define MAX_CFUNC_LINES 32
+
+typedef struct {
+    char name[16];
+    char params[MAX_CFUNC_PARAMS][16];
+    int param_cnt;
+    char lines[MAX_CFUNC_LINES][CODE_LINE_MAX_LEN];
+    int line_cnt;
+} cfunc_t;
+
+static cfunc_t c_functions[MAX_CFUNCS];
+static int c_function_cnt = 0;
+static int c_return_val = 0;
+static int c_has_returned = 0;
+
+static void c_exec_block(char lines[][CODE_LINE_MAX_LEN], int count, int start, int end);
 
 static int eval_atom(const char **pp) {
     const char *p = expr_ws(*pp);
@@ -2906,35 +3917,91 @@ static int eval_atom(const char **pp) {
         char name[16]; int ni = 0;
         while (expr_is_alnum(*p) && ni < 15) name[ni++] = *p++;
         name[ni] = '\0';
-        *pp = p;
 
-        if (str_cmp(name, "True") == 0) return 1;
-        if (str_cmp(name, "False") == 0) return 0;
+        if (str_cmp(name, "True") == 0) { *pp = p; return 1; }
+        if (str_cmp(name, "False") == 0) { *pp = p; return 0; }
 
-        p = expr_ws(p);
-        if (*p == '(' && str_cmp(name, "len") == 0) {
-            p++;
-            p = expr_ws(p);
-            if (*p == '"' || *p == '\'') {
-                char q = *p++; int slen = 0;
-                while (*p && *p != q) { slen++; p++; }
-                if (*p == q) p++;
+        const char *after_name = expr_ws(p);
+        if (*after_name == '(') {
+            if (str_cmp(name, "len") == 0) {
+                p = after_name + 1;
                 p = expr_ws(p);
-                if (*p == ')') p++;
-                *pp = p;
-                return slen;
-            } else {
-                char arg[16]; int ai = 0;
-                while (expr_is_alnum(*p) && ai < 15) arg[ai++] = *p++;
-                arg[ai] = '\0';
-                p = expr_ws(p);
-                if (*p == ')') p++;
-                *pp = p;
-                const char *sv = var_get_str(arg);
-                return sv ? str_len(sv) : 0;
+                if (*p == '"' || *p == '\'') {
+                    char q = *p++; int slen = 0;
+                    while (*p && *p != q) { slen++; p++; }
+                    if (*p == q) p++;
+                    p = expr_ws(p);
+                    if (*p == ')') p++;
+                    *pp = p;
+                    return slen;
+                } else {
+                    char arg[16]; int ai = 0;
+                    while (expr_is_alnum(*p) && ai < 15) arg[ai++] = *p++;
+                    arg[ai] = '\0';
+                    p = expr_ws(p);
+                    if (*p == ')') p++;
+                    *pp = p;
+                    const char *sv = var_get_str(arg);
+                    return sv ? str_len(sv) : 0;
+                }
+            }
+
+            /* Check user-defined C functions */
+            for (int fi = 0; fi < c_function_cnt; fi++) {
+                if (str_cmp(c_functions[fi].name, name) == 0) {
+                    p = after_name + 1; /* past '(' */
+                    int args[MAX_CFUNC_PARAMS];
+                    int argc = 0;
+                    p = expr_ws(p);
+                    while (*p && *p != ')' && argc < MAX_CFUNC_PARAMS) {
+                        args[argc++] = eval_expr_full(&p);
+                        p = expr_ws(p);
+                        if (*p == ',') { p++; p = expr_ws(p); }
+                    }
+                    if (*p == ')') p++;
+                    *pp = p;
+
+                    /* Save current values of parameter variables */
+                    var_t saved_vars[MAX_CFUNC_PARAMS];
+                    int had_var[MAX_CFUNC_PARAMS];
+                    for (int ai = 0; ai < c_functions[fi].param_cnt; ai++) {
+                        had_var[ai] = 0;
+                        for (int vi = 0; vi < env_var_cnt; vi++) {
+                            if (str_cmp(env_vars[vi].name, c_functions[fi].params[ai]) == 0) {
+                                saved_vars[ai] = env_vars[vi];
+                                had_var[ai] = 1;
+                                break;
+                            }
+                        }
+                        if (ai < argc) {
+                            var_set_int(c_functions[fi].params[ai], args[ai]);
+                        }
+                    }
+
+                    int old_ret = c_return_val;
+                    int old_has_ret = c_has_returned;
+                    c_return_val = 0;
+                    c_has_returned = 0;
+
+                    c_exec_block(c_functions[fi].lines, c_functions[fi].line_cnt, 0, c_functions[fi].line_cnt);
+
+                    int result = c_return_val;
+
+                    /* Restore parameter variables */
+                    for (int ai = 0; ai < c_functions[fi].param_cnt; ai++) {
+                        if (had_var[ai]) {
+                            var_set_int(saved_vars[ai].name, saved_vars[ai].val);
+                        }
+                    }
+                    c_return_val = old_ret;
+                    c_has_returned = old_has_ret;
+
+                    return result;
+                }
             }
         }
 
+        *pp = p;
         const char *sv = var_get_str(name);
         if (sv) return mini_atoi(sv);
         return var_get_int(name);
@@ -3001,10 +4068,7 @@ static int eval_expr_s(const char *s) {
     return eval_expr_full(&p);
 }
 
-/* ============================================================
- * PYTHON MULTI-LINE INTERPRETER
- * Processes all lines at once with indentation-based block tracking.
- * ============================================================ */
+
 
 static int py_indent(const char *line) {
     int n = 0;
@@ -3304,10 +4368,7 @@ static void py_run_program(char lines[][CODE_LINE_MAX_LEN], int total) {
     py_exec_block(lines, total, 0, total);
 }
 
-/* ============================================================
- * C MULTI-LINE INTERPRETER
- * Processes all lines at once with brace-based block tracking.
- * ============================================================ */
+
 
 static int c_has_open_brace(const char *line) {
     int len = str_len(line);
@@ -3391,13 +4452,143 @@ static void c_do_printf(const char *args) {
 static void c_exec_block(char lines[][CODE_LINE_MAX_LEN], int count, int start, int end) {
     int pc = start;
     while (pc < end) {
+        if (c_has_returned) break;
         const char *raw = lines[pc];
         if (!raw[0]) { pc++; continue; }
         const char *L = raw;
         while (*L == ' ' || *L == '\t') L++;
         if (!*L || *L == '{' || *L == '}') { pc++; continue; }
-        if (str_ncmp(L, "//", 2) == 0 || str_ncmp(L, "#include", 8) == 0 ||
-            str_ncmp(L, "int main", 8) == 0 || str_ncmp(L, "return", 6) == 0) { pc++; continue; }
+        if (str_ncmp(L, "//", 2) == 0 ||
+            str_ncmp(L, "int main", 8) == 0) { pc++; continue; }
+
+        /* ---- return [EXPR]; ---- */
+        if (str_ncmp(L, "return", 6) == 0 && (L[6] == ' ' || L[6] == ';' || L[6] == '(')) {
+            const char *p = L + 6;
+            p = expr_ws(p);
+            if (*p != ';') {
+                c_return_val = eval_expr_full(&p);
+            } else {
+                c_return_val = 0;
+            }
+            c_has_returned = 1;
+            return;
+        }
+
+        /* ---- #include "..." (Multi-file dependency support) ---- */
+        if (str_ncmp(L, "#include", 8) == 0) {
+            const char *p = L + 8;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '"') {
+                p++;
+                char inc_name[48]; int ii = 0;
+                while (*p && *p != '"' && ii < 47) inc_name[ii++] = *p++;
+                inc_name[ii] = '\0';
+                if (ii > 0) {
+                    /* Resolve in VFS: try direct name, then /name */
+                    fs_node_t *inc_node = fs_resolve(inc_name);
+                    if (!inc_node && inc_name[0] != '/') {
+                        char inc_path[64];
+                        inc_path[0] = '/';
+                        int k = 0;
+                        while (inc_name[k] && k < 62) { inc_path[k+1] = inc_name[k]; k++; }
+                        inc_path[k+1] = '\0';
+                        inc_node = fs_resolve(inc_path);
+                    }
+                    if (inc_node && inc_node->type == FS_FILE && inc_node->data && inc_node->size > 0) {
+                        /* Parse lines from included file and execute in current environment */
+                        static char inc_lines[CODE_MAX_LINES][CODE_LINE_MAX_LEN];
+                        int inc_cnt = 0;
+                        const char *ftext = (const char *)inc_node->data;
+                        size_t fsize = inc_node->size;
+                        size_t fi = 0;
+                        while (fi < fsize && inc_cnt < CODE_MAX_LINES) {
+                            int li = 0;
+                            while (fi < fsize && ftext[fi] != '\n' && ftext[fi] != '\r' && li < CODE_LINE_MAX_LEN - 1) {
+                                inc_lines[inc_cnt][li++] = ftext[fi++];
+                            }
+                            inc_lines[inc_cnt][li] = '\0';
+                            if (fi < fsize && (ftext[fi] == '\r' || ftext[fi] == '\n')) {
+                                if (ftext[fi] == '\r' && fi + 1 < fsize && ftext[fi+1] == '\n') fi++;
+                                fi++;
+                            }
+                            inc_cnt++;
+                        }
+                        if (inc_cnt > 0) {
+                            c_exec_block(inc_lines, inc_cnt, 0, inc_cnt);
+                        }
+                    }
+                }
+            }
+            pc++; continue;
+        }
+
+        /* ---- Function definition: [int|void] name(...) { ... } ---- */
+        {
+            const char *p = L;
+            if (str_ncmp(p, "int ", 4) == 0) p += 4;
+            else if (str_ncmp(p, "void ", 5) == 0) p += 5;
+            p = expr_ws(p);
+            const char *fn_start = p;
+            while (expr_is_alnum(*p)) p++;
+            int fn_len = p - fn_start;
+            if (fn_len > 0 && fn_len < 16) {
+                const char *after_fn = expr_ws(p);
+                if (*after_fn == '(') {
+                    char fname[16];
+                    for (int k = 0; k < fn_len; k++) fname[k] = fn_start[k];
+                    fname[fn_len] = '\0';
+                    if (str_cmp(fname, "main") != 0 && str_cmp(fname, "if") != 0 &&
+                        str_cmp(fname, "for") != 0 && str_cmp(fname, "while") != 0 &&
+                        str_cmp(fname, "printf") != 0 && str_cmp(fname, "puts") != 0 &&
+                        str_cmp(fname, "beep") != 0 && str_cmp(fname, "sleep") != 0 &&
+                        str_cmp(fname, "system") != 0) {
+                        /* Register function */
+                        p = after_fn + 1; /* past '(' */
+                        cfunc_t *fn = 0;
+                        for (int i = 0; i < c_function_cnt; i++) {
+                            if (str_cmp(c_functions[i].name, fname) == 0) {
+                                fn = &c_functions[i];
+                                break;
+                            }
+                        }
+                        if (!fn && c_function_cnt < MAX_CFUNCS) {
+                            fn = &c_functions[c_function_cnt++];
+                        }
+                        if (fn) {
+                            str_cpy(fn->name, fname, 16);
+                            fn->param_cnt = 0;
+                            while (*p && *p != ')') {
+                                p = expr_ws(p);
+                                if (str_ncmp(p, "int ", 4) == 0) p += 4;
+                                else if (str_ncmp(p, "char ", 5) == 0) p += 5;
+                                p = expr_ws(p);
+                                char pname[16]; int pni = 0;
+                                while (expr_is_alnum(*p) && pni < 15) pname[pni++] = *p++;
+                                pname[pni] = '\0';
+                                if (pni > 0 && fn->param_cnt < MAX_CFUNC_PARAMS) {
+                                    str_cpy(fn->params[fn->param_cnt++], pname, 16);
+                                }
+                                p = expr_ws(p);
+                                if (*p == ',') p++;
+                            }
+                            int bs, be;
+                            c_find_body(lines, end, pc, &bs, &be);
+                            fn->line_cnt = 0;
+                            for (int li = bs; li < be && fn->line_cnt < MAX_CFUNC_LINES; li++) {
+                                str_cpy(fn->lines[fn->line_cnt++], lines[li], CODE_LINE_MAX_LEN);
+                            }
+                            pc = be;
+                            if (pc < end) {
+                                const char *t = lines[pc];
+                                while (*t == ' ' || *t == '\t') t++;
+                                if (*t == '}') pc++;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         /* ---- printf(...); ---- */
         if (str_ncmp(L, "printf(", 7) == 0) { c_do_printf(L + 7); pc++; continue; }
@@ -3573,6 +4764,9 @@ static void c_exec_block(char lines[][CODE_LINE_MAX_LEN], int count, int start, 
 
 static void c_run_program(char lines[][CODE_LINE_MAX_LEN], int total) {
     env_var_cnt = 0;
+    c_function_cnt = 0;
+    c_return_val = 0;
+    c_has_returned = 0;
     c_exec_block(lines, total, 0, total);
 }
 
@@ -3606,9 +4800,7 @@ static void codestudio_load_demo(void) {
     code_scroll_offset = 0;
 }
 
-/* ============================================================
- * CONSOLE OUTPUT APP STATE (APP_CONSOLE)
- * ============================================================ */
+
 #define CONSOLE_LINES_MAX 64
 #define CONSOLE_LINE_LEN 80
 static char console_lines[CONSOLE_LINES_MAX][CONSOLE_LINE_LEN];
@@ -3909,9 +5101,418 @@ static void draw_codestudio(gui_window_t *w)
     draw_str_clip(w->x + 6, stat_y + 1, code_output, COL_YELLOW, GRAY(4), w->x + w->w - 6);
 }
 
-/* ============================================================
- * SCREENSAVER — Starfield warp
- * ============================================================ */
+
+static void draw_coreview(gui_window_t *w)
+{
+    /* Background */
+    fill_rect(w->x + 2, w->y + 13, w->w - 4, w->h - 15, COL_BLACK);
+
+    /* Sample Hardware (always when not in VESA or when CoreView is in background) */
+    if (!gui_vesa_active || !w->focused) {
+        coreview_sample_hardware();
+        coreview_waterfall_step(coreview_gui_ram_addr);
+    }
+
+    /* 3 Tabs at top */
+    int tab_y = w->y + 14;
+    int tab_w = (w->w - 8) / 3;
+
+    for (int t = 0; t < 3; t++) {
+        int tx = w->x + 4 + t * tab_w;
+        uint8_t tbg = (t == coreview_gui_tab) ? COL_BLUE : GRAY(5);
+        uint8_t tfg = (t == coreview_gui_tab) ? COL_WHITE : GRAY(16);
+        fill_rect(tx, tab_y, tab_w - 2, 10, tbg);
+        draw_rect(tx, tab_y, tab_w - 2, 10, GRAY(12));
+        const char *tname = (t == 0) ? "1:CPU Regs" : (t == 1) ? "2:RAM Water" : "3:GPU Engine";
+        draw_str_clip(tx + 2, tab_y + 1, tname, tfg, tbg, tx + tab_w - 4);
+    }
+
+    /* Interactive Activity Spectrum Bar (0 to 9) */
+    int cur_lvl = coreview_get_active_level();
+    for (int l = 0; l < 10; l++) {
+        int bx = w->x + 4 + l * 26;
+        int by = w->y + 25;
+        uint8_t tcol = (l >= 8) ? COL_RED : (l >= 5) ? COL_YELLOW : (l >= 2) ? COL_GREEN : COL_CYAN;
+        if (l == cur_lvl) {
+            fill_rect(bx, by, 24, 9, tcol);
+            draw_rect(bx, by, 24, 9, COL_WHITE);
+            char ptxt[4] = "0"; ptxt[0] = '0' + l;
+            draw_str(bx + 9, by + 1, ptxt, COL_BLACK, tcol);
+        } else {
+            fill_rect(bx, by, 24, 9, GRAY(3));
+            draw_rect(bx, by, 24, 9, tcol);
+            char ptxt[4] = "0"; ptxt[0] = '0' + l;
+            draw_str(bx + 9, by + 1, ptxt, tcol, GRAY(3));
+        }
+    }
+
+    int body_y = w->y + 37;
+
+    if (coreview_gui_tab == 0) {
+        /* TAB 0: CPU Registers + Bit Pips + Disasm */
+        for (int r = 0; r < 6; r++) {
+            int r1 = r;
+            int r2 = r + 6;
+            int ry = body_y + 1 + r * 11;
+
+            /* Col 1 */
+            draw_str(w->x + 6, ry, coreview_get_reg_name(r1), COL_CYAN, COL_BLACK);
+            char hval[9];
+            uint32_t v1 = coreview_get_reg_val(r1);
+            for (int k = 7; k >= 0; k--) { hval[7 - k] = "0123456789ABCDEF"[(v1 >> (k * 4)) & 0xF]; }
+            hval[8] = '\0';
+            draw_str(w->x + 28, ry, hval, COL_WHITE, COL_BLACK);
+
+            /* Bit Pips for Col 1 (16 mini pips) */
+            for (int b = 0; b < 16; b++) {
+                uint8_t col = (coreview_get_bit_pulse(r1, 15 - b) > 0) ? RGB(5,4,0) :
+                              ((v1 & (1U << (15 - b))) ? COL_GREEN : GRAY(4));
+                fill_rect(w->x + 78 + b * 3, ry + 1, 2, 5, col);
+            }
+
+            /* Col 2 */
+            draw_str(w->x + 135, ry, coreview_get_reg_name(r2), COL_CYAN, COL_BLACK);
+            uint32_t v2 = coreview_get_reg_val(r2);
+            for (int k = 7; k >= 0; k--) { hval[7 - k] = "0123456789ABCDEF"[(v2 >> (k * 4)) & 0xF]; }
+            hval[8] = '\0';
+            draw_str(w->x + 158, ry, hval, COL_WHITE, COL_BLACK);
+
+            /* Bit Pips for Col 2 */
+            for (int b = 0; b < 16; b++) {
+                uint8_t col = (coreview_get_bit_pulse(r2, 15 - b) > 0) ? RGB(5,4,0) :
+                              ((v2 & (1U << (15 - b))) ? COL_GREEN : GRAY(4));
+                fill_rect(w->x + 208 + b * 3, ry + 1, 2, 5, col);
+            }
+        }
+
+        /* Disassembly Panel at Bottom */
+        int dasm_y = body_y + 70;
+        fill_rect(w->x + 4, dasm_y, w->w - 8, 48, RGB(0, 1, 2));
+        draw_rect(w->x + 4, dasm_y, w->w - 8, 48, RGB(0, 3, 5));
+        draw_str(w->x + 8, dasm_y + 3, "CS:EIP Instruction Peek:", RGB(0, 5, 5), RGB(0, 1, 2));
+
+        uint32_t curr_eip = coreview_get_cpu()->eip;
+        for (int d = 0; d < 3; d++) {
+            char bytes[16];
+            char asmtxt[48];
+            int len = coreview_disasm_at(curr_eip, bytes, asmtxt, sizeof(asmtxt));
+
+            int ly = dasm_y + 14 + d * 10;
+            if (d == 0) {
+                draw_str(w->x + 8, ly, "=>", COL_YELLOW, RGB(0, 1, 2));
+            }
+            char abuf[9];
+            for (int k = 7; k >= 0; k--) { abuf[7 - k] = "0123456789ABCDEF"[(curr_eip >> (k * 4)) & 0xF]; }
+            abuf[8] = '\0';
+            draw_str(w->x + 22, ly, abuf, GRAY(15), RGB(0, 1, 2));
+            draw_str(w->x + 72, ly, bytes, GRAY(12), RGB(0, 1, 2));
+            draw_str(w->x + 115, ly, asmtxt, (d == 0) ? COL_WHITE : COL_CYAN, RGB(0, 1, 2));
+
+            curr_eip += len;
+        }
+    } else if (coreview_gui_tab == 1) {
+        /* TAB 1: RAM Waterfall with Heat Glow */
+        char abuf[20] = "Base: 0x";
+        for (int k = 7; k >= 0; k--) { abuf[8 + 7 - k] = "0123456789ABCDEF"[(coreview_gui_ram_addr >> (k * 4)) & 0xF]; }
+        abuf[16] = '\0';
+        draw_str(w->x + 6, body_y + 1, abuf, COL_GREEN, COL_BLACK);
+
+        /* Navigation & Preset buttons */
+        fill_rect(w->x + 110, body_y, 32, 9, GRAY(6));
+        draw_rect(w->x + 110, body_y, 32, 9, GRAY(14));
+        draw_str(w->x + 112, body_y + 1, "<Prev", COL_WHITE, GRAY(6));
+
+        fill_rect(w->x + 146, body_y, 32, 9, GRAY(6));
+        draw_rect(w->x + 146, body_y, 32, 9, GRAY(14));
+        draw_str(w->x + 148, body_y + 1, "Next>", COL_WHITE, GRAY(6));
+
+        fill_rect(w->x + 182, body_y, 26, 9, GRAY(6));
+        draw_rect(w->x + 182, body_y, 26, 9, GRAY(14));
+        draw_str(w->x + 184, body_y + 1, "Tick", COL_YELLOW, GRAY(6));
+
+        fill_rect(w->x + 212, body_y, 26, 9, GRAY(6));
+        draw_rect(w->x + 212, body_y, 26, 9, GRAY(14));
+        draw_str(w->x + 214, body_y + 1, "Code", COL_CYAN, GRAY(6));
+
+        fill_rect(w->x + 242, body_y, 24, 9, GRAY(6));
+        draw_rect(w->x + 242, body_y, 24, 9, GRAY(14));
+        draw_str(w->x + 244, body_y + 1, "Stk", COL_WHITE, GRAY(6));
+
+        const uint8_t *wdata = coreview_waterfall_get_data();
+        const uint8_t *wheat = coreview_waterfall_get_heat();
+
+        for (int r = 0; r < 8; r++) {
+            int ry = body_y + 12 + r * 12;
+            char off[7];
+            uint32_t row_addr = coreview_gui_ram_addr + r * 16;
+            for (int k = 3; k >= 0; k--) { off[3 - k] = "0123456789ABCDEF"[(row_addr >> (k * 4)) & 0xF]; }
+            off[4] = ':'; off[5] = '\0';
+            draw_str(w->x + 6, ry, off, GRAY(12), COL_BLACK);
+
+            /* Hex bytes */
+            for (int c = 0; c < 16; c++) {
+                int idx = r * 16 + c;
+                char hb[3];
+                hb[0] = "0123456789ABCDEF"[(wdata[idx] >> 4) & 0xF];
+                hb[1] = "0123456789ABCDEF"[wdata[idx] & 0xF];
+                hb[2] = '\0';
+
+                uint8_t col;
+                if (wheat[idx] > 180) col = COL_WHITE;
+                else if (wheat[idx] > 80) col = COL_YELLOW;
+                else if (wdata[idx] > 0) col = COL_CYAN;
+                else col = GRAY(4);
+
+                draw_str(w->x + 36 + c * 10, ry, hb, col, COL_BLACK);
+            }
+
+            /* ASCII */
+            for (int c = 0; c < 8; c++) {
+                int idx = r * 16 + c;
+                char ch = (char)wdata[idx];
+                if (ch < 32 || ch > 126) ch = '.';
+                char cs[2] = { ch, '\0' };
+                draw_str(w->x + 202 + c * 6, ry, cs, (wheat[idx] > 80) ? COL_YELLOW : GRAY(14), COL_BLACK);
+            }
+        }
+    } else {
+        /* TAB 2: GPU Engine & Raster Beam */
+        coreview_gpu_t gpu;
+        coreview_sample_gpu(&gpu);
+
+        char perf[48];
+        snprintf(perf, sizeof(perf), "FPS: %d  |  %d MB/s  |  BGA %dx%d", gpu.fps, gpu.vram_bandwidth_mb, gpu.bga_xres, gpu.bga_yres);
+        draw_str(w->x + 6, body_y + 2, perf, COL_CYAN, COL_BLACK);
+
+        char v1[9], v2[9];
+        for (int k = 7; k >= 0; k--) {
+            v1[7-k] = "0123456789ABCDEF"[(gpu.crtc[0x00] >> (k*4)) & 0xF];
+            v2[7-k] = "0123456789ABCDEF"[(gpu.crtc[0x06] >> (k*4)) & 0xF];
+        }
+        v1[8] = '\0'; v2[8] = '\0';
+
+        draw_str(w->x + 8, body_y + 16, "H-Total: 0x", COL_WHITE, COL_BLACK);
+        draw_str(w->x + 72, body_y + 16, v1, COL_CYAN, COL_BLACK);
+        draw_str(w->x + 130, body_y + 16, "V-Total: 0x", COL_WHITE, COL_BLACK);
+        draw_str(w->x + 194, body_y + 16, v2, COL_CYAN, COL_BLACK);
+
+        draw_str(w->x + 8, body_y + 28, "Cursor Pos:", COL_WHITE, COL_BLACK);
+        char cpos[9];
+        for (int k = 7; k >= 0; k--) { cpos[7-k] = "0123456789ABCDEF"[(gpu.cursor_pos >> (k*4)) & 0xF]; }
+        cpos[8] = '\0';
+        draw_str(w->x + 78, body_y + 28, cpos, COL_CYAN, COL_BLACK);
+
+        /* VBLANK Indicator */
+        draw_str(w->x + 8, body_y + 44, "Raster Status:", COL_WHITE, COL_BLACK);
+        if (gpu.vblank) {
+            fill_rect(w->x + 90, body_y + 43, 85, 9, COL_RED);
+            draw_str(w->x + 94, body_y + 44, "[ VBLANK RETRACE ]", COL_WHITE, COL_RED);
+        } else {
+            fill_rect(w->x + 90, body_y + 43, 85, 9, COL_GREEN);
+            draw_str(w->x + 96, body_y + 44, "[ ACTIVE SCAN ]", COL_BLACK, COL_GREEN);
+        }
+
+        /* Live Electron Beam Tracker */
+        draw_str(w->x + 8, body_y + 58, "Electron Beam Scanline:", COL_YELLOW, COL_BLACK);
+        char slstr[16];
+        itoa(gpu.scanline, slstr, 10);
+        draw_str(w->x + 155, body_y + 58, slstr, COL_WHITE, COL_BLACK);
+        draw_str(w->x + 185, body_y + 58, "/ 600", GRAY(12), COL_BLACK);
+
+        /* Oscilloscope / Beam progress bar */
+        int bar_w = w->w - 20;
+        int bar_y = body_y + 72;
+        fill_rect(w->x + 10, bar_y, bar_w, 14, GRAY(2));
+        draw_rect(w->x + 10, bar_y, bar_w, 14, RGB(0, 3, 5));
+
+        int beam_pos = (gpu.scanline * bar_w) / 600;
+        if (beam_pos > 0) {
+            fill_rect(w->x + 11, bar_y + 1, beam_pos, 12, RGB(0, 3, 2));
+        }
+        fill_rect(w->x + 10 + beam_pos - 1, bar_y + 1, 3, 12, COL_CYAN);
+    }
+}
+
+static void handle_coreview_click(gui_window_t *w, int mx, int my)
+{
+    int tab_y = w->y + 14;
+    int tab_w = (w->w - 8) / 3;
+    if (tab_w < 1) tab_w = 1;
+
+    /* Tabs Click */
+    if (my >= tab_y && my <= tab_y + 12) {
+        if (mx >= w->x + 4 && mx < w->x + 4 + 3 * tab_w) {
+            int t = (mx - (w->x + 4)) / tab_w;
+            if (t >= 0 && t < 3) {
+                coreview_gui_tab = t;
+                sound_click();
+                return;
+            }
+        }
+    }
+
+    /* Spectrum Bar Click (0 to 9) */
+    if (my >= w->y + 24 && my <= w->y + 35) {
+        if (mx >= w->x + 4 && mx < w->x + 264) {
+            int lvl = (mx - (w->x + 4)) / 26;
+            if (lvl < 0) lvl = 0;
+            if (lvl > 9) lvl = 9;
+            coreview_set_active_level(lvl);
+            coreview_gui_ram_addr = (uint32_t)coreview_get_activity_addr(lvl);
+            sound_click();
+            return;
+        }
+    }
+
+    if (coreview_gui_tab == 1) {
+        /* Prev / Next / Ticks / Code / Stack buttons */
+        if (my >= w->y + 36 && my <= w->y + 50) {
+            if (mx >= w->x + 110 && mx < w->x + 144) {
+                if (coreview_gui_ram_addr >= 128) coreview_gui_ram_addr -= 128;
+                else coreview_gui_ram_addr = 0;
+                sound_click();
+            } else if (mx >= w->x + 146 && mx < w->x + 180) {
+                coreview_gui_ram_addr += 128;
+                sound_click();
+            } else if (mx >= w->x + 182 && mx < w->x + 210) {
+                coreview_set_active_level(9);
+                coreview_gui_ram_addr = (uint32_t)coreview_get_activity_addr(9); /* Ticks / IRQ0 (Rank 9) */
+                sound_click();
+            } else if (mx >= w->x + 212 && mx < w->x + 240) {
+                coreview_set_active_level(2);
+                coreview_gui_ram_addr = (uint32_t)coreview_get_activity_addr(2); /* Code (Rank 2) */
+                sound_click();
+            } else if (mx >= w->x + 242 && mx <= w->x + 268) {
+                coreview_set_active_level(5);
+                coreview_gui_ram_addr = (uint32_t)coreview_get_activity_addr(5); /* Stack (Rank 5) */
+                sound_click();
+            }
+        }
+    }
+}
+
+
+static int screensaver_mode = 0; /* 0: Starfield, 1: 3D Cube, 2: Mystify */
+static int gui_active_workspace = 0; /* 0: Workspace 1, 1: Workspace 2 */
+
+static const int16_t sin_table64[64] = {
+    0, 25, 50, 74, 98, 121, 142, 162, 181, 198, 213, 226, 237, 246, 251, 255,
+    256, 255, 251, 246, 237, 226, 213, 198, 181, 162, 142, 121, 98, 74, 50, 25,
+    0, -25, -50, -74, -98, -121, -142, -162, -181, -198, -213, -226, -237, -246, -251, -255,
+    -256, -255, -251, -246, -237, -226, -213, -198, -181, -162, -142, -121, -98, -74, -50, -25
+};
+static inline int isin(int a) {
+    a = (a % 64 + 64) % 64;
+    return sin_table64[a];
+}
+static inline int icos(int a) {
+    return isin(a + 16);
+}
+
+static void draw_screensaver_cube(void) {
+    fill_rect(0, 0, 320, 200, COL_BLACK);
+
+    static int ang_x = 0, ang_y = 0, ang_z = 0;
+    ang_x = (ang_x + 1) % 64;
+    ang_y = (ang_y + 2) % 64;
+    ang_z = (ang_z + 1) % 64;
+
+    static const int cube_verts[8][3] = {
+        {-32, -32, -32}, { 32, -32, -32}, { 32,  32, -32}, {-32,  32, -32},
+        {-32, -32,  32}, { 32, -32,  32}, { 32,  32,  32}, {-32,  32,  32}
+    };
+    static const int cube_edges[12][2] = {
+        {0,1},{1,2},{2,3},{3,0},
+        {4,5},{5,6},{6,7},{7,4},
+        {0,4},{1,5},{2,6},{3,7}
+    };
+
+    int proj_x[8], proj_y[8];
+    for (int i = 0; i < 8; i++) {
+        int x0 = cube_verts[i][0];
+        int y0 = cube_verts[i][1];
+        int z0 = cube_verts[i][2];
+
+        /* Rotate X */
+        int y1 = (y0 * icos(ang_x) - z0 * isin(ang_x)) >> 8;
+        int z1 = (y0 * isin(ang_x) + z0 * icos(ang_x)) >> 8;
+
+        /* Rotate Y */
+        int x2 = (x0 * icos(ang_y) + z1 * isin(ang_y)) >> 8;
+        int z2 = (-x0 * isin(ang_y) + z1 * icos(ang_y)) >> 8;
+
+        /* Rotate Z */
+        int x3 = (x2 * icos(ang_z) - y1 * isin(ang_z)) >> 8;
+        int y3 = (x2 * isin(ang_z) + y1 * icos(ang_z)) >> 8;
+
+        int dist = 140 + z2;
+        if (dist < 10) dist = 10;
+        proj_x[i] = 160 + (x3 * 160) / dist;
+        proj_y[i] = 100 + (y3 * 160) / dist;
+    }
+
+    for (int e = 0; e < 12; e++) {
+        int u = cube_edges[e][0], v = cube_edges[e][1];
+        uint8_t col = (e < 4) ? COL_CYAN : (e < 8 ? COL_PINK : COL_LIME);
+        draw_line(proj_x[u], proj_y[u], proj_x[v], proj_y[v], col);
+    }
+
+    draw_str(75, 180, "Screensaver: 3D Rotating Cube [Space: Next]", GRAY(6), COL_BLACK);
+}
+
+#define MYST_PTS 4
+#define MYST_HIST 8
+static void draw_screensaver_mystify(void) {
+    fill_rect(0, 0, 320, 200, COL_BLACK);
+
+    static int mx[MYST_HIST][MYST_PTS];
+    static int my[MYST_HIST][MYST_PTS];
+    static int vx[MYST_PTS] = { 4, -3, 3, -4 };
+    static int vy[MYST_PTS] = { 3, 4, -4, 3 };
+    static int mhead = 0;
+    static int minit = 0;
+
+    if (!minit) {
+        minit = 1;
+        mx[0][0] = 50;  my[0][0] = 50;
+        mx[0][1] = 270; my[0][1] = 60;
+        mx[0][2] = 250; my[0][2] = 160;
+        mx[0][3] = 70;  my[0][3] = 150;
+        for (int h = 1; h < MYST_HIST; h++) {
+            for (int p = 0; p < MYST_PTS; p++) {
+                mx[h][p] = mx[0][p];
+                my[h][p] = my[0][p];
+            }
+        }
+    }
+
+    int next_head = (mhead + 1) % MYST_HIST;
+    for (int p = 0; p < MYST_PTS; p++) {
+        int nx = mx[mhead][p] + vx[p];
+        int ny = my[mhead][p] + vy[p];
+        if (nx <= 4 || nx >= 315) vx[p] = -vx[p];
+        if (ny <= 4 || ny >= 180) vy[p] = -vy[p];
+        mx[next_head][p] = nx;
+        my[next_head][p] = ny;
+    }
+    mhead = next_head;
+
+    static const uint8_t trail_cols[MYST_HIST] = {
+        GRAY(3), GRAY(5), GRAY(7), COL_BLUE, COL_CYAN, COL_GREEN, COL_YELLOW, COL_WHITE
+    };
+
+    for (int h = 0; h < MYST_HIST; h++) {
+        int idx = (mhead + 1 + h) % MYST_HIST;
+        uint8_t col = trail_cols[h];
+        for (int p = 0; p < MYST_PTS; p++) {
+            int np = (p + 1) % MYST_PTS;
+            draw_line(mx[idx][p], my[idx][p], mx[idx][np], my[idx][np], col);
+        }
+    }
+
+    draw_str(80, 184, "Screensaver: Mystify Curves [Space: Next]", GRAY(6), COL_BLACK);
+}
+
 #define NUM_STARS 60
 typedef struct { int x, y, z; } star_t;
 static star_t stars[NUM_STARS];
@@ -3925,6 +5526,13 @@ static void saver_init(void) {
 }
 
 static void draw_screensaver(void) {
+    if (screensaver_mode == 1) {
+        draw_screensaver_cube();
+        return;
+    } else if (screensaver_mode == 2) {
+        draw_screensaver_mystify();
+        return;
+    }
     fill_rect(0, 0, 320, 200, COL_BLACK);
     for (int i = 0; i < NUM_STARS; i++) {
         stars[i].z -= 2;
@@ -3945,18 +5553,147 @@ static void draw_screensaver(void) {
     }
     /* Dim "ArchaOS" watermark */
     draw_str(108, 96, "ArchaOS", GRAY(4), COL_BLACK);
-    draw_str(94, 104, "Press any key...", GRAY(3), COL_BLACK);
+    draw_str(75, 104, "Screensaver: Starfield 3D [Space: Next]", GRAY(3), COL_BLACK);
 }
 
-/* ============================================================
- * DRAW WINDOW & DESKTOP
- * ============================================================ */
+/* QuickRunner (Spotlight) State */
+static char qr_input[64] = "";
+static int qr_input_len = 0;
+static char qr_result[64] = "";
+static int qr_match_win = -1;
 
+static int qr_eval_math(const char *expr, int *out_val) {
+    const char *p = expr;
+    while (*p == ' ') p++;
+    if (!*p) return 0;
+
+    int has_op = 0;
+    int acc = 0;
+    char op = '+';
+
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        int num = 0;
+        int is_num = 0;
+        int sign = 1;
+        if (*p == '-') { sign = -1; p++; }
+        while (*p >= '0' && *p <= '9') {
+            num = num * 10 + (*p - '0');
+            is_num = 1;
+            p++;
+        }
+        num *= sign;
+
+        if (is_num) {
+            if (op == '+') acc += num;
+            else if (op == '-') acc -= num;
+            else if (op == '*') acc *= num;
+            else if (op == '/' && num != 0) acc /= num;
+        }
+
+        while (*p == ' ') p++;
+        if (*p == '+' || *p == '-' || *p == '*' || *p == '/') {
+            op = *p++;
+            has_op = 1;
+        } else if (*p) {
+            return 0;
+        }
+    }
+    if (has_op) {
+        *out_val = acc;
+        return 1;
+    }
+    return 0;
+}
+
+static void qr_update_search(void) {
+    qr_result[0] = '\0';
+    qr_match_win = -1;
+    if (qr_input_len == 0) return;
+
+    int math_val = 0;
+    if (qr_eval_math(qr_input, &math_val)) {
+        strcpy(qr_result, "= ");
+        char nbuf[16];
+        itoa(math_val, nbuf, 10);
+        strcat(qr_result, nbuf);
+        return;
+    }
+
+    for (int i = 0; i < win_count; i++) {
+        const char *t = windows[i].title;
+        const char *st = windows[i].short_title;
+        int match = 0;
+        for (int k = 0; t && t[k]; k++) {
+            int found = 1;
+            for (int j = 0; j < qr_input_len; j++) {
+                char c1 = qr_input[j]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                char c2 = t[k + j];   if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                if (c1 != c2) { found = 0; break; }
+            }
+            if (found) { match = 1; break; }
+        }
+        if (!match && st) {
+            for (int k = 0; st[k]; k++) {
+                int found = 1;
+                for (int j = 0; j < qr_input_len; j++) {
+                    char c1 = qr_input[j]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                    char c2 = st[k + j];   if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                    if (c1 != c2) { found = 0; break; }
+                }
+                if (found) { match = 1; break; }
+            }
+        }
+        if (match) {
+            qr_match_win = i;
+            strcpy(qr_result, "-> Launch ");
+            strcat(qr_result, windows[i].title);
+            return;
+        }
+    }
+}
+
+static void draw_quickrunner(void) {
+    if (!quickrunner_active) return;
+
+    int qx = 60, qy = 55, qw = 200, qh = 44;
+
+    fill_rect(qx + 4, qy + 4, qw, qh, GRAY(2));
+    fill_rect(qx + 2, qy + 2, qw, qh, GRAY(4));
+
+    fill_rect(qx, qy, qw, qh, GRAY(28));
+    draw_rect(qx, qy, qw, qh, COL_TEAL);
+    draw_rect(qx + 1, qy + 1, qw - 2, qh - 2, COL_BLUE);
+
+    fill_rect(qx + 8, qy + 6, qw - 16, 14, COL_WHITE);
+    draw_rect(qx + 8, qy + 6, qw - 16, 14, GRAY(10));
+    draw_str(qx + 12, qy + 10, "Q>", COL_BLUE, COL_WHITE);
+    draw_str(qx + 26, qy + 10, qr_input, COL_BLACK, COL_WHITE);
+
+    if ((pit_ticks() / 300) % 2 == 0) {
+        int cx = qx + 26 + qr_input_len * 6;
+        if (cx < qx + qw - 20) {
+            fill_rect(cx, qy + 10, 2, 8, COL_BLACK);
+        }
+    }
+
+    if (qr_result[0] != '\0') {
+        draw_str_clip(qx + 12, qy + 26, qr_result, COL_GREEN, GRAY(28), qx + qw - 12);
+    } else {
+        draw_str(qx + 12, qy + 26, "Type app or math [Esc: Close]", GRAY(12), GRAY(28));
+    }
+}
+
+
+
+#ifndef TASKBAR_Y
 #define TASKBAR_Y  188
+#endif
 #define TASKBAR_H  12
 #define COL_TASKBAR GRAY(3)
 
-static int start_menu_open = 0;
 static int start_menu_selected_idx = 0;
 
 /* Window open animation flash — draws a highlight border that fades */
@@ -3990,8 +5727,16 @@ static void draw_window(int idx)
     fill_rect(w->x, w->y, w->w, 12, title_bg);
 
     /* Icon on Left of Title Bar */
-    draw_app_icon(w->x + 3, w->y + 3, w->app);
-    draw_str_clip(w->x + 13, w->y + 2, w->title, COL_WHITE, title_bg, w->x + w->w - 34);
+    draw_window_icon(w->x + 3, w->y + 3, idx);
+    int max_title_x = w->x + w->w - 34;
+    draw_str_clip(w->x + 13, w->y + 2, w->title, COL_WHITE, title_bg, max_title_x);
+    if (w->author[0] != '\0') {
+        int tlen = str_len(w->title);
+        int cur_x = w->x + 13 + tlen * 6;
+        if (cur_x + 12 < max_title_x) {
+            draw_str_clip(cur_x + 6, w->y + 2, w->author, COL_CYAN, title_bg, max_title_x);
+        }
+    }
 
     /* Controls: Minimize _, Split |, Maximize =, Close X */
     fill_rect(w->x + w->w - 32, w->y + 2, 7, 8, GRAY(14));
@@ -4027,7 +5772,50 @@ static void draw_window(int idx)
         case APP_CODESTUDIO: draw_codestudio(w); break;
         case APP_CONSOLE:    draw_console(w); break;
         case APP_BROWSER:    draw_browser(w); break;
-        case APP_AI_CHAT:    draw_ai_chat(w); break;
+        case APP_COREVIEW:   draw_coreview(w); break;
+        case APP_USER_WIN: {
+            if (w->user_canvas && w->client_w > 0 && w->client_h > 0) {
+                int max_cw = w->w - 2;
+                int max_ch = w->h - 13;
+                if (max_cw < 0) max_cw = 0;
+                if (max_ch < 0) max_ch = 0;
+                int draw_w = (w->client_w < max_cw) ? w->client_w : max_cw;
+                int draw_h = (w->client_h < max_ch) ? w->client_h : max_ch;
+                for (int cy = 0; cy < draw_h; cy++) {
+                    int py = w->y + 12 + cy;
+                    if (py >= SCREEN_H) break;
+                    for (int cx = 0; cx < draw_w; cx++) {
+                        int px = w->x + 1 + cx;
+                        if (px >= SCREEN_W) break;
+                        put_pixel(px, py, w->user_canvas[cy * w->client_w + cx]);
+                    }
+                }
+            } else if (w->user_canvas32 && w->user_canvas32_w > 0 && w->user_canvas32_h > 0) {
+                int max_cw = w->w - 2;
+                int max_ch = w->h - 13;
+                if (max_cw < 0) max_cw = 0;
+                if (max_ch < 0) max_ch = 0;
+                int draw_w = (w->client_w < max_cw) ? w->client_w : max_cw;
+                int draw_h = (w->client_h < max_ch) ? w->client_h : max_ch;
+                for (int cy = 0; cy < draw_h; cy++) {
+                    int py = w->y + 12 + cy;
+                    if (py >= SCREEN_H) break;
+                    int sy = (cy * w->user_canvas32_h) / draw_h;
+                    const uint32_t *s = w->user_canvas32 + sy * w->user_canvas32_w;
+                    for (int cx = 0; cx < draw_w; cx++) {
+                        int px = w->x + 1 + cx;
+                        if (px >= SCREEN_W) break;
+                        int sx = (cx * w->user_canvas32_w) / draw_w;
+                        uint32_t c = s[sx];
+                        uint8_t pal = RGB((((c >> 16) & 0xFF) * 5) / 255,
+                                          (((c >> 8) & 0xFF) * 5) / 255,
+                                          ((c & 0xFF) * 5) / 255);
+                        put_pixel(px, py, pal);
+                    }
+                }
+            }
+            break;
+        }
         default: break;
     }
 
@@ -4035,10 +5823,7 @@ static void draw_window(int idx)
     draw_win_open_flash(w);
 }
 
-/* ============================================================
- * CONTEXT MENU & DESKTOP ICONS STATE
- * ============================================================ */
-static int ctx_menu_open = 0;
+
 static int ctx_menu_x = 0, ctx_menu_y = 0;
 static int selected_desktop_icon = -1;
 static int selected_desktop_file = -1;
@@ -4067,42 +5852,84 @@ static void draw_context_menu(void)
     }
 }
 
+static void launch_elf_app(const char *path)
+{
+    int pid = elf_load_file_args(path, path);
+    if (pid > 0) {
+        show_toast("Launched application", TOAST_OK);
+        sound_win_open();
+    } else {
+        show_toast("Failed to load application", TOAST_ERR);
+        sound_error();
+    }
+}
+
 static void draw_start_menu(void)
 {
     if (!start_menu_open) return;
-    int mx = 2, my = 26, mw = 115, mh = 160;
+    int mx = 2, my = 16, mw = 152, mh = 170;
     fill_rect(mx + 2, my + 2, mw, mh, GRAY(2));
     fill_rect(mx, my, mw, mh, COL_WINBG);
     draw_rect(mx, my, mw, mh, COL_BLACK);
 
-    /* Intricate Vertical ArchaOS Banner */
-    fill_rect(mx, my, 18, mh, COL_BLUE);
-    draw_rect(mx, my, 18, mh, COL_TEAL);
-    draw_char(mx + 6, my + 160, 'A', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 148, 'R', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 136, 'C', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 124, 'H', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 112, 'A', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 100, 'O', COL_WHITE, COL_BLUE);
-    draw_char(mx + 6, my + 88,  'S', COL_WHITE, COL_BLUE);
+    /* Modern Sleek ArchaOS Tech Sidebar */
+    fill_rect(mx, my, 18, mh, RGB(0, 1, 2));
+    draw_vline(mx + 1, my + 1, mh - 2, RGB(0, 2, 4));
+    draw_vline(mx + 18, my, mh, RGB(0, 3, 5));
 
-    static const char *menu_items[13] = {
+    /* Glowing ArchaOS Core Emblem */
+    fill_rect(mx + 2, my + 3, 15, 15, RGB(0, 2, 4));
+    draw_rect(mx + 2, my + 3, 15, 15, RGB(0, 4, 5));
+    put_pixel(mx + 9, my + 5, COL_CYAN);
+    put_pixel(mx + 8, my + 6, COL_CYAN); put_pixel(mx + 10, my + 6, COL_CYAN);
+    put_pixel(mx + 7, my + 7, COL_CYAN); put_pixel(mx + 11, my + 7, COL_CYAN);
+    put_pixel(mx + 6, my + 8, COL_CYAN); put_pixel(mx + 12, my + 8, COL_CYAN);
+    put_pixel(mx + 5, my + 9, COL_CYAN); put_pixel(mx + 13, my + 9, COL_CYAN);
+    draw_hline(mx + 5, my + 10, 9, COL_WHITE);
+    put_pixel(mx + 4, my + 11, COL_CYAN); put_pixel(mx + 14, my + 11, COL_CYAN);
+    put_pixel(mx + 4, my + 12, COL_CYAN); put_pixel(mx + 14, my + 12, COL_CYAN);
+    put_pixel(mx + 3, my + 13, COL_CYAN); put_pixel(mx + 15, my + 13, COL_CYAN);
+
+    /* Subtle separator */
+    draw_hline(mx + 3, my + 21, 13, RGB(0, 4, 5));
+
+    /* Vertical Typography: A R C H A (White) O S (Cyan) - perfectly fitted */
+    draw_char(mx + 5, my + 26, 'A', COL_WHITE, RGB(0, 1, 2));
+    draw_char(mx + 5, my + 40, 'R', COL_WHITE, RGB(0, 1, 2));
+    draw_char(mx + 5, my + 54, 'C', COL_WHITE, RGB(0, 1, 2));
+    draw_char(mx + 5, my + 68, 'H', COL_WHITE, RGB(0, 1, 2));
+    draw_char(mx + 5, my + 82, 'A', COL_WHITE, RGB(0, 1, 2));
+    draw_char(mx + 5, my + 96, 'O', COL_CYAN,  RGB(0, 1, 2));
+    draw_char(mx + 5, my + 110, 'S', COL_CYAN,  RGB(0, 1, 2));
+
+    /* Status indicators */
+    draw_hline(mx + 3, my + 124, 13, RGB(0, 3, 4));
+    fill_rect(mx + 5, my + 130, 2, 2, RGB(0, 5, 2));
+    fill_rect(mx + 9, my + 130, 2, 2, RGB(0, 5, 5));
+    fill_rect(mx + 13, my + 130, 2, 2, RGB(1, 3, 5));
+
+    /* Bottom status core pip */
+    put_pixel(mx + 9, my + 143, RGB(0, 5, 3));
+    fill_rect(mx + 8, my + 144, 3, 3, RGB(0, 5, 4));
+    put_pixel(mx + 9, my + 147, RGB(0, 5, 3));
+
+    static const char *menu_items[14] = {
         "Calculator", "Painter", "Minesweeper", "File Manager",
         "Notepad", "Control Panel", "Task Manager", "Image Viewer",
         "Snake", "Terminal", "App Studio", "Web Browser",
-        "AI Assistant"
+        "Silicon Monitor", "Run Program..."
     };
 
-    static const app_type_t menu_apps[13] = {
+    static const app_type_t menu_apps[14] = {
         APP_CALC, APP_PAINTER, APP_MINESWEEPER, APP_FILEMAN,
         APP_NOTEPAD, APP_CPANEL, APP_TASKMAN, APP_IMGVIEW,
         APP_SNAKE, APP_CLI, APP_CODESTUDIO, APP_BROWSER,
-        APP_AI_CHAT
+        APP_COREVIEW, APP_USER_WIN
     };
 
-    for (int i = 0; i < 13; i++) {
+    for (int i = 0; i < 14; i++) {
         app_type_t app_id = menu_apps[i];
-        int item_y = my + 3 + i * 12;
+        int item_y = my + 3 + i * 11;
         if (i == start_menu_selected_idx) {
             fill_rect(mx + 19, item_y - 1, mw - 20, 11, COL_BLUE);
             draw_app_icon(mx + 21, item_y + 1, app_id);
@@ -4111,7 +5938,7 @@ static void draw_start_menu(void)
             draw_app_icon(mx + 21, item_y + 1, app_id);
             draw_str(mx + 31, item_y + 1, menu_items[i], COL_BLACK, COL_WINBG);
         }
-        if (i < 12) draw_hline(mx + 20, item_y + 11, mw - 22, GRAY(18));
+        if (i < 13) draw_hline(mx + 20, item_y + 10, mw - 22, GRAY(18));
     }
 }
 
@@ -4125,24 +5952,25 @@ static void draw_processbar(void)
     draw_rect(2, TASKBAR_Y + 1, 54, 10, GRAY(14));
     draw_str(5, TASKBAR_Y + 3, "ArchaOS", COL_GREEN, start_menu_open ? GRAY(12) : GRAY(8));
 
-    /* Count Open Windows (visible == 1) */
+    /* Count Open Windows (visible == 1 on current workspace) */
     int open_cnt = 0;
-    for (int i = 0; i < win_count; i++) if (windows[i].visible) open_cnt++;
+    for (int i = 0; i < win_count; i++)
+        if (windows[i].visible && windows[i].workspace == gui_active_workspace) open_cnt++;
 
     if (open_cnt > 0) {
-        int avail_w = 205; /* space from x=58 to x=263 */
+        int avail_w = 175; /* space from x=58 to x=233 */
         int btn_w = avail_w / open_cnt;
         if (btn_w > 75) btn_w = 75;
         int bx = 58;
 
         for (int i = 0; i < win_count; i++) {
-            if (windows[i].visible) {
+            if (windows[i].visible && windows[i].workspace == gui_active_workspace) {
                 uint8_t bbg = (i == focused_win && !windows[i].minimized) ? GRAY(14) : GRAY(6);
                 fill_rect(bx, TASKBAR_Y + 1, btn_w - 2, 10, bbg);
                 draw_rect(bx, TASKBAR_Y + 1, btn_w - 2, 10, GRAY(14));
 
                 /* Draw Program Icon */
-                draw_app_icon(bx + 2, TASKBAR_Y + 3, windows[i].app);
+                draw_window_icon(bx + 2, TASKBAR_Y + 3, i);
 
                 /* If width allows text, draw title */
                 if (btn_w >= 55) {
@@ -4156,6 +5984,16 @@ static void draw_processbar(void)
         }
     }
 
+    /* Dual Workspace Pager: [ 1 ] [ 2 ] */
+    int wp_y = TASKBAR_Y + 1;
+    fill_rect(236, wp_y, 13, 10, gui_active_workspace == 0 ? COL_BLUE : GRAY(8));
+    draw_rect(236, wp_y, 13, 10, GRAY(14));
+    draw_str(240, wp_y + 2, "1", COL_WHITE, gui_active_workspace == 0 ? COL_BLUE : GRAY(8));
+
+    fill_rect(251, wp_y, 13, 10, gui_active_workspace == 1 ? COL_BLUE : GRAY(8));
+    draw_rect(251, wp_y, 13, 10, GRAY(14));
+    draw_str(255, wp_y + 2, "2", COL_WHITE, gui_active_workspace == 1 ? COL_BLUE : GRAY(8));
+
     /* Clock */
     uint8_t h, m, s;
     rtc_read(&h, &m, &s);
@@ -4168,18 +6006,68 @@ static void draw_processbar(void)
 
 static void get_desktop_slot_pos(int slot_idx, int *out_x, int *out_y)
 {
-    /* 6 columns across desktop (0..5), 3 items per column (0..2) */
-    int col = (slot_idx / 3) % 6;
-    int row = slot_idx % 3;
+    /* 6 columns across desktop (0..5), 4 items per column (0..3) */
+    int col = (slot_idx / 4) % 6;
+    int row = slot_idx % 4;
     if (out_x) *out_x = 8 + col * 52;
-    if (out_y) *out_y = 16 + row * 48;
+    if (out_y) *out_y = 14 + row * 42;
+}
+
+static fs_node_t *desktop_files[24];
+static int desktop_file_count = 0;
+
+static void update_desktop_file_list(void)
+{
+    desktop_file_count = 0;
+
+    /* 1. Add GUI applications from /bin declaring ARCHAOS_GUI_APP */
+    fs_node_t *bin = fs_resolve("/bin");
+    if (bin && bin->type == FS_DIR) {
+        for (int i = 0; i < bin->child_count && desktop_file_count < 24; i++) {
+            fs_node_t *f = bin->children[i];
+            if (!f || f->type != FS_FILE) continue;
+            int nlen = str_len(f->name);
+            /* Only .elf binaries declaring ARCHAOS_GUI_APP / ARCHAOS_APP_TITLE load onto desktop */
+            if (nlen >= 4 && str_cmp(f->name + nlen - 4, ".elf") == 0) {
+                int is_gui_app = 0;
+                if (f->data && f->size > 16) {
+                    const char magic[] = "ARCHAOS_GUI:";
+                    size_t mlen = 12;
+                    for (size_t b = 0; b + mlen <= f->size; b++) {
+                        int match = 1;
+                        for (size_t k = 0; k < mlen; k++) {
+                            if (f->data[b + k] != (uint8_t)magic[k]) { match = 0; break; }
+                        }
+                        if (match) {
+                            is_gui_app = 1;
+                            break;
+                        }
+                    }
+                }
+                if (is_gui_app) {
+                    desktop_files[desktop_file_count++] = f;
+                }
+            }
+        }
+    }
+
+    /* 2. Add user files from root */
+    fs_node_t *root = fs_root();
+    if (root) {
+        for (int i = 0; i < root->child_count && desktop_file_count < 24; i++) {
+            fs_node_t *f = root->children[i];
+            if (!f || f->type != FS_FILE) continue;
+            if (f->name[0] == '.' || str_cmp(f->name, "tmp_pipe") == 0) continue;
+            desktop_files[desktop_file_count++] = f;
+        }
+    }
 }
 
 static void draw_desktop_icons(void)
 {
     /* Render clickable app shortcuts seamlessly on desktop across all 6 columns */
     int slot = 0;
-    for (int i = 0; i < win_count; i++) {
+    for (int i = 0; i < 14 && i < win_count; i++) {
         int ix, iy;
         get_desktop_slot_pos(slot++, &ix, &iy);
         
@@ -4194,42 +6082,78 @@ static void draw_desktop_icons(void)
         draw_str_clip(ix, iy + 14, windows[i].short_title, COL_WHITE, text_bg, ix + 42);
     }
 
-    /* Render User Files from VFS root seamlessly packed into remaining slots */
-    fs_node_t *root = fs_root();
-    if (root) {
-        for (int i = 0; i < root->child_count && slot < 18; i++) {
-            fs_node_t *f = root->children[i];
-            if (!f || f->type != FS_FILE) continue;
-            if (f->name[0] == '.' || str_cmp(f->name, "tmp_pipe") == 0) continue;
+    /* Render User Files and /bin Applications seamlessly packed into remaining slots */
+    update_desktop_file_list();
+    for (int i = 0; i < desktop_file_count && slot < 24; i++) {
+        fs_node_t *f = desktop_files[i];
+        if (!f) continue;
 
-            int ix, iy;
-            get_desktop_slot_pos(slot++, &ix, &iy);
+        int ix, iy;
+        get_desktop_slot_pos(slot++, &ix, &iy);
 
-            if (selected_desktop_file == i) {
-                fill_rect(ix - 2, iy - 2, 44, 28, RGB(0,2,4));
-                draw_rect(ix - 2, iy - 2, 44, 28, COL_WHITE);
+        if (selected_desktop_file == i) {
+            fill_rect(ix - 2, iy - 2, 44, 28, RGB(0,2,4));
+            draw_rect(ix - 2, iy - 2, 44, 28, COL_WHITE);
+        }
+
+        int nlen = str_len(f->name);
+        int is_wav = (nlen >= 4 && str_cmp(f->name + nlen - 4, ".wav") == 0);
+        int is_vid = (nlen >= 4 && str_cmp(f->name + nlen - 4, ".vid") == 0);
+        int is_py  = (nlen >= 3 && str_cmp(f->name + nlen - 3, ".py") == 0);
+        int is_elf = (nlen >= 4 && str_cmp(f->name + nlen - 4, ".elf") == 0);
+
+        if (is_wav || is_vid) {
+            fill_rect(ix + 18, iy + 2, 8, 8, is_vid ? RGB(0,3,5) : RGB(0,5,2));
+            draw_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
+            draw_char(ix + 20, iy + 2, '>', COL_WHITE, is_vid ? RGB(0,3,5) : RGB(0,5,2));
+        } else if (is_py) {
+            fill_rect(ix + 18, iy + 2, 8, 8, RGB(5,4,0));
+            draw_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
+            draw_char(ix + 20, iy + 2, 'P', COL_WHITE, RGB(5,4,0));
+        } else if (is_elf) {
+            fill_rect(ix + 18, iy + 2, 8, 8, RGB(0,2,4));
+            draw_rect(ix + 18, iy + 2, 8, 8, COL_CYAN);
+            draw_char(ix + 20, iy + 2, '*', COL_WHITE, RGB(0,2,4));
+        } else {
+            fill_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
+            draw_rect(ix + 18, iy + 2, 8, 8, GRAY(10));
+            draw_char(ix + 20, iy + 2, '=', COL_BLACK, COL_WHITE);
+        }
+
+        uint8_t text_bg = (selected_desktop_file == i) ? RGB(0,2,4) : 0xFF;
+        if (is_elf) {
+            char short_name[16];
+            short_name[0] = '\0';
+            if (f->data && f->size > 16) {
+                const char magic[] = "ARCHAOS_GUI:";
+                size_t mlen = 12;
+                for (size_t b = 0; b + mlen <= f->size; b++) {
+                    int match = 1;
+                    for (size_t k = 0; k < mlen; k++) {
+                        if (f->data[b + k] != (uint8_t)magic[k]) { match = 0; break; }
+                    }
+                    if (match) {
+                        const char *meta_title = (const char *)(f->data + b + mlen);
+                        int t = 0;
+                        while (meta_title[t] && meta_title[t] != '\n' && t < 15) {
+                            short_name[t] = meta_title[t];
+                            t++;
+                        }
+                        short_name[t] = '\0';
+                        break;
+                    }
+                }
             }
-
-            int nlen = str_len(f->name);
-            int is_wav = (nlen >= 4 && str_cmp(f->name + nlen - 4, ".wav") == 0);
-            int is_vid = (nlen >= 4 && str_cmp(f->name + nlen - 4, ".vid") == 0);
-            int is_py  = (nlen >= 3 && str_cmp(f->name + nlen - 3, ".py") == 0);
-
-            if (is_wav || is_vid) {
-                fill_rect(ix + 18, iy + 2, 8, 8, is_vid ? RGB(0,3,5) : RGB(0,5,2));
-                draw_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
-                draw_char(ix + 20, iy + 2, '>', COL_WHITE, is_vid ? RGB(0,3,5) : RGB(0,5,2));
-            } else if (is_py) {
-                fill_rect(ix + 18, iy + 2, 8, 8, RGB(5,4,0));
-                draw_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
-                draw_char(ix + 20, iy + 2, 'P', COL_WHITE, RGB(5,4,0));
-            } else {
-                fill_rect(ix + 18, iy + 2, 8, 8, COL_WHITE);
-                draw_rect(ix + 18, iy + 2, 8, 8, GRAY(10));
-                draw_char(ix + 20, iy + 2, '=', COL_BLACK, COL_WHITE);
+            if (short_name[0] == '\0') {
+                int sni = 0;
+                while (sni < nlen - 4 && sni < 15) {
+                    short_name[sni] = f->name[sni];
+                    sni++;
+                }
+                short_name[sni] = '\0';
             }
-
-            uint8_t text_bg = (selected_desktop_file == i) ? RGB(0,2,4) : 0xFF;
+            draw_str_clip(ix, iy + 14, short_name, COL_WHITE, text_bg, ix + 42);
+        } else {
             draw_str_clip(ix, iy + 14, f->name, COL_WHITE, text_bg, ix + 42);
         }
     }
@@ -4267,9 +6191,7 @@ static void draw_desktop(void)
     draw_str(SCREEN_W - 74, TASKBAR_Y - 14, "ArchaOS v0.5", COL_BLACK, gui_desktop_color);
 }
 
-/* ============================================================
- * TOAST NOTIFICATION RENDERING (replaces error dialog)
- * ============================================================ */
+
 static void draw_toast(void)
 {
     if (!toast_visible) return;
@@ -4295,6 +6217,49 @@ static void draw_toast(void)
     char icon = (toast_type == TOAST_ERR) ? '!' : (toast_type == TOAST_INFO) ? 'i' : '+';
     draw_char(tx + 3, ty + 2, icon, COL_WHITE, bg);
     draw_str_clip(tx + 11, ty + 2, toast_msg, COL_WHITE, bg, tx + tw - 2);
+}
+
+
+static char     watchdog_hung_title[32] = "";
+static uint32_t watchdog_hung_pid = 0;
+
+static void draw_watchdog_modal(void)
+{
+    if (!watchdog_modal_active) return;
+
+    int ww = 210, wh = 66;
+    int wx = (SCREEN_W - ww) / 2;
+    int wy = (SCREEN_H - wh) / 2;
+
+    /* Drop shadow */
+    fill_rect(wx + 3, wy + 3, ww, wh, GRAY(2));
+
+    /* Dialog Body */
+    fill_rect(wx, wy, ww, wh, GRAY(21));
+    draw_rect(wx, wy, ww, wh, COL_BLACK);
+
+    /* Titlebar (Alert Red) */
+    fill_rect(wx + 1, wy + 1, ww - 2, 12, RGB(4, 1, 1));
+    draw_str(wx + 4, wy + 3, "! Process Not Responding", COL_WHITE, RGB(4, 1, 1));
+
+    /* Message */
+    char prompt_msg[48];
+    prompt_msg[0] = '\0';
+    str_cpy(prompt_msg, watchdog_hung_title, 24);
+    int plen = str_len(prompt_msg);
+    if (plen < 40) str_cpy(prompt_msg + plen, " stopped responding", 24);
+    draw_str_clip(wx + 8, wy + 18, prompt_msg, COL_BLACK, GRAY(21), wx + ww - 8);
+    draw_str(wx + 8, wy + 29, "Wait for it or force quit?", GRAY(8), GRAY(21));
+
+    /* [ Wait ] Button */
+    fill_rect(wx + 25, wy + 44, 60, 14, GRAY(18));
+    draw_rect(wx + 25, wy + 44, 60, 14, COL_BLACK);
+    draw_str(wx + 42, wy + 47, "Wait", COL_BLACK, GRAY(18));
+
+    /* [ Force Quit ] Button */
+    fill_rect(wx + 105, wy + 44, 75, 14, RGB(4, 1, 1));
+    draw_rect(wx + 105, wy + 44, 75, 14, COL_BLACK);
+    draw_str(wx + 112, wy + 47, "Force Quit", COL_WHITE, RGB(4, 1, 1));
 }
 
 int gui_cursor_type = 0; /* 0: Arrow, 1: Hand, 2: I-Beam, 3: Spinner */
@@ -4464,6 +6429,84 @@ static void draw_mouse_cursor(int mx, int my)
     }
 }
 
+static void vesa_draw_mouse_cursor(uint32_t *vbb, int mx, int my)
+{
+    if (!vbb) return;
+    int vx = (mx * 800) / 320;
+    int vy = (my * 600) / 200;
+
+    if (gui_cursor_type == 1) { /* Hand */
+        for (int r = 0; r < 12; r++) {
+            for (int c = 0; c < 11; c++) {
+                uint8_t v = MOUSE_HAND[r][c];
+                if (v == 0) continue;
+                uint32_t col = (v == 1) ? 0xFF000000 : 0xFFFFFFFF;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int px = vx + (c - 3) * 2 + dx;
+                        int py = vy + r * 2 + dy;
+                        if (px >= 0 && px < 800 && py >= 0 && py < 600) {
+                            vbb[py * 800 + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (gui_cursor_type == 2) { /* I-Beam */
+        for (int r = 0; r < 11; r++) {
+            for (int c = 0; c < 7; c++) {
+                uint8_t v = MOUSE_IBEAM[r][c];
+                if (v == 0) continue;
+                uint32_t col = 0xFF000000;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int px = vx + (c - 3) * 2 + dx;
+                        int py = vy + (r - 5) * 2 + dy;
+                        if (px >= 0 && px < 800 && py >= 0 && py < 600) {
+                            vbb[py * 800 + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    } else if (gui_cursor_type == 3) { /* Spinning Loader */
+        int frame = (int)((pit_ticks() / 3) % 8);
+        for (int r = 0; r < 8; r++) {
+            for (int c = 0; c < 8; c++) {
+                uint8_t v = SPINNER_SHAPE[frame][r][c];
+                if (v == 0) continue;
+                uint32_t col = (v == 1) ? 0xFF000000 : (v == 2) ? 0xFF94A3B8 : 0xFF00E5FF;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int px = vx + c * 2 + dx;
+                        int py = vy + r * 2 + dy;
+                        if (px >= 0 && px < 800 && py >= 0 && py < 600) {
+                            vbb[py * 800 + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    } else { /* Default Arrow */
+        for (int r = 0; r < 11; r++) {
+            for (int c = 0; c < 11; c++) {
+                uint8_t v = MOUSE_ARROW[r][c];
+                if (v == 0) continue;
+                uint32_t col = (v == 1) ? 0xFF000000 : 0xFFFFFFFF;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int px = vx + c * 2 + dx;
+                        int py = vy + r * 2 + dy;
+                        if (px >= 0 && px < 800 && py >= 0 && py < 600) {
+                            vbb[py * 800 + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void gui_cooperative_pump(const char *status_msg)
 {
     if (status_msg && status_msg[0]) {
@@ -4495,25 +6538,549 @@ static void redraw_all_frame(int mx, int my)
 {
     if (screensaver_active) {
         draw_screensaver();
-        draw_mouse_cursor(mx, my);
+        if (!gui_vesa_active) draw_mouse_cursor(mx, my);
         gui_flip();
         return;
     }
 
     draw_desktop();
     for (int i = win_count - 1; i >= 0; i--)
-        if (i != focused_win) draw_window(i);
+        if (i != focused_win && windows[i].workspace == gui_active_workspace) draw_window(i);
 
-    if (focused_win >= 0 && focused_win < win_count)
+    if (focused_win >= 0 && focused_win < win_count && windows[focused_win].workspace == gui_active_workspace)
         draw_window(focused_win);
 
     draw_start_menu();
     draw_processbar();
     draw_context_menu();
     draw_toast();           /* Toast overlays instead of blocking alert */
-    draw_mouse_cursor(mx, my);
+    draw_watchdog_modal();  /* Application Not Responding modal */
+    draw_quickrunner();     /* QuickRunner Spotlight modal */
+    if (!gui_vesa_active) {
+        int hide_cur = 0;
+        if (focused_win >= 0 && focused_win < win_count) {
+            gui_window_t *fw = &windows[focused_win];
+            if (fw->visible && !fw->minimized && fw->is_user_win && fw->cursor_mode != 0) {
+                hide_cur = 1;
+            }
+        }
+        if (!hide_cur) {
+            draw_mouse_cursor(mx, my);
+        }
+    }
 
     gui_flip();
+}
+
+/* =========================================================================
+ * Kernel GUI Compositor & Syscall Implementations
+ * ========================================================================= */
+
+void gui_kernel_push_event(gui_window_t *w, const gui_raw_event_t *ev)
+{
+    if (!w || !ev) return;
+    int next = (w->event_tail + 1) % 128;
+    if (next != w->event_head) {
+        w->event_queue[w->event_tail] = *ev;
+        w->event_tail = next;
+    }
+}
+
+int gui_kernel_get_event(int win, gui_raw_event_t *ev)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return 0;
+    gui_window_t *w = &windows[win];
+    if (!w->is_user_win || !w->visible) return 0;
+    if (w->event_head == w->event_tail) return 0;
+    if (ev) {
+        *ev = w->event_queue[w->event_head];
+    }
+    w->event_head = (w->event_head + 1) % 128;
+    return 1;
+}
+
+int gui_kernel_create_window(const char *title, int w, int h)
+{
+    if (!gui_active) {
+        vga_print("\n[GUI ERROR] GUI desktop is not active! Launch GUI with 'gui' first.\n");
+        return -1;
+    }
+
+    int is_fullscreen = 0;
+    if (w == -1 || h == -1) {
+        /* Fullscreen preset requested: maximize across desktop above taskbar */
+        w = SCREEN_W - 2;
+        h = TASKBAR_Y - 13;
+        is_fullscreen = 1;
+    } else if (w == -2 || h == -2) {
+        /* Halfscreen preset requested */
+        w = (SCREEN_W / 2) - 4;
+        h = TASKBAR_Y - 16;
+    } else if (w <= 0 || h <= 0) {
+        /* Unspecified / 0 by dev: default to half-screen centered */
+        w = (SCREEN_W / 2) - 4;
+        h = TASKBAR_Y - 16;
+    } else {
+        /* Dev custom size */
+        if (w > SCREEN_W - 2) w = SCREEN_W - 2;
+        if (h > TASKBAR_Y - 13) h = TASKBAR_Y - 13;
+    }
+
+    int slot = -1;
+    for (int i = 14; i < MAX_WINDOWS; i++) {
+        if (!windows[i].visible && !windows[i].is_user_win) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1) return -1;
+
+    uint8_t *canvas = (uint8_t *)kmalloc((size_t)(w * h));
+    if (!canvas) return -1;
+
+    for (int i = 0; i < w * h; i++) {
+        canvas[i] = 0x07; /* Light Gray / RGB(4,4,4) */
+    }
+
+    gui_window_t *win = &windows[slot];
+    win->client_w = w;
+    win->client_h = h;
+    win->w = w + 2;
+    win->h = h + 13;
+    win->x = (SCREEN_W - win->w) / 2;
+    win->y = (TASKBAR_Y - win->h) / 2;
+    if (win->x < 0) win->x = 0;
+    if (win->y < 0) win->y = 0;
+    win->saved_x = win->x;
+    win->saved_y = win->y;
+    win->saved_w = win->w;
+    win->saved_h = win->h;
+
+    if (title && title[0]) {
+        int i = 0;
+        while (title[i] && i < 31) {
+            win->user_title[i] = title[i];
+            i++;
+        }
+        win->user_title[i] = '\0';
+    } else {
+        str_cpy(win->user_title, "App Window", 32);
+    }
+    win->title = win->user_title;
+    win->short_title = win->user_title;
+
+    win->app = APP_USER_WIN;
+    win->visible = 1;
+    win->focused = 1;
+    win->minimized = 0;
+    win->maximized = is_fullscreen;
+    win->split_state = 0;
+    win->open_tick = pit_ticks();
+    win->user_canvas = canvas;
+    win->user_canvas32 = NULL;
+    win->user_canvas32_w = 0;
+    win->user_canvas32_h = 0;
+    win->is_user_win = 1;
+    win->cursor_mode = 0;
+    win->has_custom_icon = 0;
+    win->custom_icon_color = 0;
+    win->author[0] = '\0';
+    win->event_head = 0;
+    win->event_tail = 0;
+
+    if (focused_win >= 0 && focused_win < win_count) {
+        windows[focused_win].focused = 0;
+    }
+    focused_win = slot;
+
+    if (slot >= win_count) {
+        win_count = slot + 1;
+    }
+
+    sound_win_open();
+    if (gui_active) {
+        redraw_all_frame(mouse_x, mouse_y);
+    }
+
+    return slot;
+}
+
+void gui_kernel_draw_rect(int win, int x, int y, int w, int h, uint8_t color)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *win_ptr = &windows[win];
+    if (!win_ptr->is_user_win || !win_ptr->user_canvas) return;
+    if (w <= 0 || h <= 0) return;
+
+    int max_w = win_ptr->client_w;
+    int max_h = win_ptr->client_h;
+
+    for (int r = y; r < y + h; r++) {
+        if (r < 0 || r >= max_h) continue;
+        for (int c = x; c < x + w; c++) {
+            if (c < 0 || c >= max_w) continue;
+            win_ptr->user_canvas[r * max_w + c] = color;
+        }
+    }
+}
+
+void gui_kernel_draw_text(int win, int x, int y, const char *text, uint8_t color)
+{
+    if (win < 0 || win >= MAX_WINDOWS || !text) return;
+    gui_window_t *win_ptr = &windows[win];
+    if (!win_ptr->is_user_win || !win_ptr->user_canvas) return;
+
+    int max_w = win_ptr->client_w;
+    int max_h = win_ptr->client_h;
+    int cur_x = x;
+    int cur_y = y;
+
+    while (*text) {
+        char ch = *text++;
+        if (ch == '\n') {
+            cur_x = x;
+            cur_y += 8;
+            continue;
+        }
+        if (ch < 32 || ch > 126) ch = '?';
+        const uint8_t *glyph = FONT[(int)ch - 32];
+        for (int col = 0; col < 5; col++) {
+            int px = cur_x + col;
+            if (px < 0 || px >= max_w) continue;
+            for (int r = 0; r < 7; r++) {
+                int py = cur_y + r;
+                if (py < 0 || py >= max_h) continue;
+                uint8_t bit = (glyph[col] >> r) & 1;
+                if (bit) {
+                    win_ptr->user_canvas[py * max_w + px] = color;
+                }
+            }
+        }
+        cur_x += 6;
+    }
+}
+
+void gui_kernel_draw_pixel(int win, int x, int y, uint8_t color)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *win_ptr = &windows[win];
+    if (!win_ptr->is_user_win || !win_ptr->user_canvas) return;
+
+    if (x >= 0 && x < win_ptr->client_w && y >= 0 && y < win_ptr->client_h) {
+        win_ptr->user_canvas[y * win_ptr->client_w + x] = color;
+    }
+}
+
+void gui_kernel_clear(int win, uint8_t color)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *win_ptr = &windows[win];
+    if (!win_ptr->is_user_win || !win_ptr->user_canvas) return;
+
+    int total = win_ptr->client_w * win_ptr->client_h;
+    for (int i = 0; i < total; i++) {
+        win_ptr->user_canvas[i] = color;
+    }
+}
+
+void gui_kernel_update(int win)
+{
+    (void)win;
+    last_activity_tick = pit_ticks();
+    if (screensaver_active) screensaver_active = 0;
+    if (gui_active) {
+        redraw_all_frame(mouse_x, mouse_y);
+    }
+}
+
+void gui_kernel_close_window(int win)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *w = &windows[win];
+    w->visible = 0;
+    w->focused = 0;
+    w->is_user_win = 0;
+    w->cursor_mode = 0;
+    w->has_custom_icon = 0;
+    w->custom_icon_color = 0;
+    w->author[0] = '\0';
+    w->client_w = 0;
+    w->client_h = 0;
+    if (w->user_canvas) {
+        kfree(w->user_canvas);
+        w->user_canvas = NULL;
+    }
+    if (w->user_canvas32) {
+        kfree(w->user_canvas32);
+        w->user_canvas32 = NULL;
+    }
+    w->user_canvas32_w = 0;
+    w->user_canvas32_h = 0;
+    w->event_head = 0;
+    w->event_tail = 0;
+    if (focused_win == win) {
+        focused_win = -1;
+    }
+    if (gui_active) {
+        redraw_all_frame(mouse_x, mouse_y);
+    }
+}
+
+void gui_kernel_draw_buffer(int win, const void *buf, int w, int h, int format)
+{
+    last_activity_tick = pit_ticks();
+    if (screensaver_active) screensaver_active = 0;
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *win_ptr = &windows[win];
+    if (!win_ptr->is_user_win) return;
+    if (!buf || w <= 0 || h <= 0) return;
+
+    if (format == 0) {
+        /* 8-bit palette buffer */
+        if (!win_ptr->user_canvas) return;
+        int copy_w = w < win_ptr->client_w ? w : win_ptr->client_w;
+        int copy_h = h < win_ptr->client_h ? h : win_ptr->client_h;
+        const uint8_t *src = (const uint8_t *)buf;
+        for (int y = 0; y < copy_h; y++) {
+            memcpy(win_ptr->user_canvas + y * win_ptr->client_w, src + y * w, copy_w);
+        }
+    } else {
+        /* 32-bit ARGB/XRGB buffer */
+        if (!win_ptr->user_canvas32 || win_ptr->user_canvas32_w != w || win_ptr->user_canvas32_h != h) {
+            if (win_ptr->user_canvas32) {
+                kfree(win_ptr->user_canvas32);
+            }
+            win_ptr->user_canvas32 = (uint32_t *)kmalloc((size_t)(w * h * 4));
+            win_ptr->user_canvas32_w = w;
+            win_ptr->user_canvas32_h = h;
+        }
+        if (win_ptr->user_canvas32) {
+            memcpy(win_ptr->user_canvas32, buf, (size_t)(w * h * 4));
+        }
+    }
+}
+
+void gui_kernel_set_icon(int win, const uint8_t *icon, uint8_t color)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *w = &windows[win];
+    if (!w->is_user_win) return;
+    if (icon) {
+        for (int r = 0; r < 7; r++) {
+            for (int c = 0; c < 7; c++) {
+                w->custom_icon[r][c] = icon[r * 7 + c] ? 1 : 0;
+            }
+        }
+        w->has_custom_icon = 1;
+        w->custom_icon_color = color;
+        if (gui_active) {
+            redraw_all_frame(mouse_x, mouse_y);
+        }
+    }
+}
+
+void gui_kernel_set_author(int win, const char *author)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *w = &windows[win];
+    if (!w->is_user_win) return;
+    if (author) {
+        int i = 0;
+        while (author[i] && i < 31) {
+            w->author[i] = author[i];
+            i++;
+        }
+        w->author[i] = '\0';
+        if (gui_active) {
+            redraw_all_frame(mouse_x, mouse_y);
+        }
+    }
+}
+
+void gui_kernel_set_title(int win, const char *title)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *w = &windows[win];
+    if (!w->is_user_win) return;
+    if (title) {
+        int i = 0;
+        while (title[i] && i < 31) {
+            w->user_title[i] = title[i];
+            i++;
+        }
+        w->user_title[i] = '\0';
+        w->title = w->user_title;
+        w->short_title = w->user_title;
+        if (gui_active) {
+            redraw_all_frame(mouse_x, mouse_y);
+        }
+    }
+}
+
+void gui_kernel_set_cursor_mode(int win, int mode)
+{
+    if (win < 0 || win >= MAX_WINDOWS) return;
+    gui_window_t *w = &windows[win];
+    if (!w->is_user_win) return;
+    w->cursor_mode = mode;
+    if (mode == 2) {
+        mouse_x = w->x + w->w / 2;
+        mouse_y = w->y + w->h / 2;
+    }
+    if (gui_active) {
+        redraw_all_frame(mouse_x, mouse_y);
+    }
+}
+
+
+
+static int is_text_content(const char *data, size_t size) {
+    if (!data || size == 0) return 1; /* empty file can be opened in text editor */
+    size_t check_len = size < 256 ? size : 256;
+    for (size_t i = 0; i < check_len; i++) {
+        uint8_t c = (uint8_t)data[i];
+        if (c == 0) return 0; /* Null byte -> binary */
+        if (c < 32 && c != '\n' && c != '\r' && c != '\t') return 0; /* Control chars -> binary */
+    }
+    return 1;
+}
+
+static int gui_decode_bmp(const uint8_t *data, size_t size, uint8_t *out_rgb, int max_w, int max_h, int *out_w, int *out_h) {
+    if (!data || size < 54) return -1;
+    if (data[0] != 'B' || data[1] != 'M') return -1;
+
+    uint32_t offset = (uint32_t)data[10] | ((uint32_t)data[11] << 8) | ((uint32_t)data[12] << 16) | ((uint32_t)data[13] << 24);
+    int32_t w = (int32_t)((uint32_t)data[18] | ((uint32_t)data[19] << 8) | ((uint32_t)data[20] << 16) | ((uint32_t)data[21] << 24));
+    int32_t h = (int32_t)((uint32_t)data[22] | ((uint32_t)data[23] << 8) | ((uint32_t)data[24] << 16) | ((uint32_t)data[25] << 24));
+    uint16_t bpp = (uint16_t)data[28] | ((uint16_t)data[29] << 8);
+
+    if (w <= 0 || h == 0) return -1;
+    int is_top_down = (h < 0);
+    if (h < 0) h = -h;
+
+    int target_w = (w > max_w) ? max_w : w;
+    int target_h = (h > max_h) ? max_h : h;
+    *out_w = target_w;
+    *out_h = target_h;
+
+    if (bpp == 24) {
+        uint32_t row_stride = (w * 3 + 3) & ~3;
+        for (int y = 0; y < target_h; y++) {
+            int file_y = is_top_down ? ((y * h) / target_h) : (h - 1 - ((y * h) / target_h));
+            const uint8_t *src_row = data + offset + file_y * row_stride;
+            if ((size_t)(offset + file_y * row_stride + w * 3) > size) break;
+            for (int x = 0; x < target_w; x++) {
+                int src_x = (x * w) / target_w;
+                uint8_t b = src_row[src_x * 3 + 0];
+                uint8_t g = src_row[src_x * 3 + 1];
+                uint8_t r = src_row[src_x * 3 + 2];
+                out_rgb[(y * target_w + x) * 3 + 0] = r;
+                out_rgb[(y * target_w + x) * 3 + 1] = g;
+                out_rgb[(y * target_w + x) * 3 + 2] = b;
+            }
+        }
+        return 0;
+    } else if (bpp == 32) {
+        uint32_t row_stride = w * 4;
+        for (int y = 0; y < target_h; y++) {
+            int file_y = is_top_down ? ((y * h) / target_h) : (h - 1 - ((y * h) / target_h));
+            const uint8_t *src_row = data + offset + file_y * row_stride;
+            if ((size_t)(offset + file_y * row_stride + w * 4) > size) break;
+            for (int x = 0; x < target_w; x++) {
+                int src_x = (x * w) / target_w;
+                uint8_t b = src_row[src_x * 4 + 0];
+                uint8_t g = src_row[src_x * 4 + 1];
+                uint8_t r = src_row[src_x * 4 + 2];
+                out_rgb[(y * target_w + x) * 3 + 0] = r;
+                out_rgb[(y * target_w + x) * 3 + 1] = g;
+                out_rgb[(y * target_w + x) * 3 + 2] = b;
+            }
+        }
+        return 0;
+    } else if (bpp == 8) {
+        uint32_t dib_header_size = (uint32_t)data[14] | ((uint32_t)data[15] << 8) | ((uint32_t)data[16] << 16) | ((uint32_t)data[17] << 24);
+        const uint8_t *palette = data + 14 + dib_header_size;
+        uint32_t row_stride = (w + 3) & ~3;
+        for (int y = 0; y < target_h; y++) {
+            int file_y = is_top_down ? ((y * h) / target_h) : (h - 1 - ((y * h) / target_h));
+            const uint8_t *src_row = data + offset + file_y * row_stride;
+            if ((size_t)(offset + file_y * row_stride + w) > size) break;
+            for (int x = 0; x < target_w; x++) {
+                int src_x = (x * w) / target_w;
+                uint8_t pal_idx = src_row[src_x];
+                uint8_t b = palette[pal_idx * 4 + 0];
+                uint8_t g = palette[pal_idx * 4 + 1];
+                uint8_t r = palette[pal_idx * 4 + 2];
+                out_rgb[(y * target_w + x) * 3 + 0] = r;
+                out_rgb[(y * target_w + x) * 3 + 1] = g;
+                out_rgb[(y * target_w + x) * 3 + 2] = b;
+            }
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static void gui_load_image(fs_node_t *f) {
+    if (!f || !f->data || f->size == 0) return;
+    str_cpy(imgview_filename, f->name, 32);
+    imgview_has_image = 0;
+
+    /* 1. Try universal stb_image decoder first (supports all BMP variants, PNG, JPG, GIF, SVG, etc.) */
+    decoded_image_t dimg;
+    if (image_decode((const uint8_t *)f->data, f->size, &dimg) == 0 && dimg.pixels && dimg.width > 0 && dimg.height > 0) {
+        int tw = dimg.width;
+        int th = dimg.height;
+        if (tw > IMGVIEW_BUF_W || th > IMGVIEW_BUF_H) {
+            if (tw * IMGVIEW_BUF_H > th * IMGVIEW_BUF_W) {
+                th = (th * IMGVIEW_BUF_W) / tw;
+                tw = IMGVIEW_BUF_W;
+            } else {
+                tw = (tw * IMGVIEW_BUF_H) / th;
+                th = IMGVIEW_BUF_H;
+            }
+        }
+        if (tw < 1) tw = 1;
+        if (th < 1) th = 1;
+        imgview_width = tw;
+        imgview_height = th;
+        for (int y = 0; y < imgview_height; y++) {
+            int src_y = (y * dimg.height) / imgview_height;
+            if (src_y >= dimg.height) src_y = dimg.height - 1;
+            for (int x = 0; x < imgview_width; x++) {
+                int src_x = (x * dimg.width) / imgview_width;
+                if (src_x >= dimg.width) src_x = dimg.width - 1;
+                int src_idx = (src_y * dimg.width + src_x) * 3;
+                int dst_idx = (y * imgview_width + x) * 3;
+                imgview_pixels[dst_idx + 0] = dimg.pixels[src_idx + 0];
+                imgview_pixels[dst_idx + 1] = dimg.pixels[src_idx + 1];
+                imgview_pixels[dst_idx + 2] = dimg.pixels[src_idx + 2];
+            }
+        }
+        imgview_has_image = 1;
+        image_free(&dimg);
+    } else {
+        /* 2. Fallback to custom BMP decoder with matching row stride */
+        int decoded_w = 0, decoded_h = 0;
+        if (gui_decode_bmp((const uint8_t *)f->data, f->size, imgview_pixels, IMGVIEW_BUF_W, IMGVIEW_BUF_H, &decoded_w, &decoded_h) == 0) {
+            imgview_width = decoded_w;
+            imgview_height = decoded_h;
+            imgview_has_image = 1;
+        }
+    }
+
+    /* Also copy to paint_canvas so Painter app can edit it if opened */
+    if (imgview_has_image) {
+        str_cpy(paint_filename, f->name, 32);
+        for (int row = 0; row < PAINT_CH; row++) {
+            int sy = (row * imgview_height) / PAINT_CH;
+            for (int col = 0; col < PAINT_CW; col++) {
+                int sx = (col * imgview_width) / PAINT_CW;
+                int idx = (sy * imgview_width + sx) * 3;
+                paint_canvas[row * PAINT_CW + col] = gui_rgb_to_vga(imgview_pixels[idx], imgview_pixels[idx+1], imgview_pixels[idx+2]);
+            }
+        }
+    }
 }
 
 /* Open file with associated app */
@@ -4521,19 +7088,103 @@ static void open_associated_file(fs_node_t *f) {
     if (!f || f->type != FS_FILE) return;
 
     int len = str_len(f->name);
-    /* Text files -> Notepad */
-    if (len >= 2 && (str_cmp(f->name + len - 4, ".txt") == 0 ||
-                     (len >= 5 && str_cmp(f->name + len - 5, ".conf") == 0) ||
-                     str_cmp(f->name + len - 2, ".c") == 0 ||
-                     str_cmp(f->name + len - 2, ".h") == 0 ||
-                     (len >= 4 && str_cmp(f->name + len - 4, ".asm") == 0) ||
-                     str_cmp(f->name + len - 3, ".md") == 0)) {
-        str_cpy(notepad_filename, f->name, 32);
 
+    /* ELF binary executable: .elf */
+    if (len >= 4 && str_cmp(f->name + len - 4, ".elf") == 0) {
+        char path[FS_MAX_PATH];
+        fs_node_t *cur = f;
+        char segments[16][FS_MAX_NAME];
+        int depth = 0;
+        while (cur && cur != fs_root() && cur->parent != cur && depth < 16) {
+            str_cpy(segments[depth++], cur->name, FS_MAX_NAME);
+            cur = cur->parent;
+        }
+        path[0] = '\0';
+        if (depth == 0) {
+            path[0] = '/';
+            path[1] = '\0';
+            int pi = str_len(path);
+            str_cpy(path + pi, f->name, FS_MAX_PATH - pi);
+        } else {
+            for (int i = depth - 1; i >= 0; i--) {
+                int pi = str_len(path);
+                if (pi < FS_MAX_PATH - 1) {
+                    path[pi] = '/';
+                    path[pi + 1] = '\0';
+                }
+                pi = str_len(path);
+                str_cpy(path + pi, segments[i], FS_MAX_PATH - pi);
+            }
+        }
+        int pid = elf_load_file_args(path, path);
+        if (pid > 0) {
+            show_toast("Launched ELF application", TOAST_OK);
+            sound_win_open();
+        } else {
+            show_toast("Failed to load ELF!", TOAST_ERR);
+            sound_error();
+        }
+        return;
+    }
+
+    /* Web Browser: .html, .htm */
+    if (len >= 5 && (str_cmp(f->name + len - 5, ".html") == 0 ||
+                     str_cmp(f->name + len - 4, ".htm") == 0)) {
+        windows[12].visible = 1;
+        windows[12].minimized = 0;
+        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
+        focused_win = 12;
+        windows[12].focused = 1;
+        windows[12].open_tick = pit_ticks();
+        sound_win_open();
+        browser_fetch(f->name);
+        return;
+    }
+
+    /* Audio & Video files -> Web Browser In-Browser Media Player */
+    if (len >= 4 && (str_cmp(f->name + len - 4, ".ogg") == 0 ||
+                     str_cmp(f->name + len - 4, ".mp3") == 0 ||
+                     str_cmp(f->name + len - 4, ".wav") == 0 ||
+                     str_cmp(f->name + len - 4, ".gif") == 0 ||
+                     str_cmp(f->name + len - 4, ".vid") == 0 ||
+                     str_cmp(f->name + len - 4, ".mpg") == 0 ||
+                     str_cmp(f->name + len - 4, ".mp4") == 0)) {
+        windows[12].visible = 1;
+        windows[12].minimized = 0;
+        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
+        focused_win = 12;
+        windows[12].focused = 1;
+        windows[12].open_tick = pit_ticks();
+        sound_win_open();
+        browser_fetch(f->name);
+        return;
+    }
+
+    /* Image files -> Image Viewer */
+    if (len >= 4 && (str_cmp(f->name + len - 4, ".bmp") == 0 ||
+                     str_cmp(f->name + len - 4, ".png") == 0 ||
+                     str_cmp(f->name + len - 4, ".jpg") == 0 ||
+                     str_cmp(f->name + len - 5, ".jpeg") == 0 ||
+                     str_cmp(f->name + len - 4, ".img") == 0)) {
+        gui_load_image(f);
+        windows[7].visible = 1;
+        windows[7].minimized = 0;
+        windows[7].open_tick = pit_ticks();
+        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
+        focused_win = 7;
+        windows[7].focused = 1;
+        sound_win_open();
+        return;
+    }
+
+    /* Python / Scripts -> Notepad */
+    if (len >= 3 && str_cmp(f->name + len - 3, ".py") == 0) {
+        str_cpy(notepad_filename, f->name, 32);
         notepad_len = 0;
+        notepad_scroll = 0;
         if (f->data) {
-            for (size_t k = 0; k < f->size && k < 500; k++) notepad_buf[k] = f->data[k];
-            notepad_len = (int)(f->size < 500 ? f->size : 500);
+            for (size_t k = 0; k < f->size && k < NOTEPAD_BUF_MAX - 1; k++) notepad_buf[k] = f->data[k];
+            notepad_len = (int)(f->size < NOTEPAD_BUF_MAX - 1 ? f->size : NOTEPAD_BUF_MAX - 1);
         }
         notepad_buf[notepad_len] = '\0';
         windows[4].visible = 1;
@@ -4543,20 +7194,89 @@ static void open_associated_file(fs_node_t *f) {
         windows[4].focused = 1;
         windows[4].open_tick = pit_ticks();
         sound_win_open();
+        return;
     }
-    /* Image files -> Image Viewer */
-    else if (len >= 4 && (str_cmp(f->name + len - 4, ".bmp") == 0 ||
-                          str_cmp(f->name + len - 4, ".png") == 0 ||
-                          str_cmp(f->name + len - 4, ".jpg") == 0 ||
-                          str_cmp(f->name + len - 4, ".img") == 0)) {
-        str_cpy(imgview_filename, f->name, 32);
-        str_cpy(paint_filename,   f->name, 32);
 
-        if (f->data) {
-            size_t sz = f->size < (size_t)(PAINT_CW * PAINT_CH) ? f->size : (size_t)(PAINT_CW * PAINT_CH);
-            for (size_t k = 0; k < sz; k++) paint_canvas[k] = (uint8_t)f->data[k];
+    /* C Source Files -> App Studio (C IDE) */
+    if (len >= 2 && str_cmp(f->name + len - 2, ".c") == 0) {
+        code_lang = LANG_C;
+        code_line_cnt = 0;
+        code_cursor_line = 0; code_cursor_col = 0; code_scroll_offset = 0;
+        if (f->data && f->size > 0) {
+            const char *src = (const char *)f->data;
+            size_t si = 0;
+            while (si < f->size && code_line_cnt < CODE_MAX_LINES) {
+                int li = 0;
+                while (si < f->size && src[si] != '\n' && src[si] != '\r' && li < CODE_LINE_MAX_LEN - 1) {
+                    code_lines[code_line_cnt][li++] = src[si++];
+                }
+                code_lines[code_line_cnt][li] = '\0';
+                if (si < f->size && (src[si] == '\r' || src[si] == '\n')) {
+                    if (src[si] == '\r' && si + 1 < f->size && src[si+1] == '\n') si++;
+                    si++;
+                }
+                code_line_cnt++;
+            }
         }
+        if (code_line_cnt == 0) {
+            code_line_cnt = 1;
+            code_lines[0][0] = '\0';
+        }
+        str_cpy(code_output, "Loaded source file", 64);
+        windows[10].visible = 1;
+        windows[10].minimized = 0;
+        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
+        focused_win = 10;
+        windows[10].focused = 1;
+        windows[10].open_tick = pit_ticks();
+        sound_win_open();
+        return;
+    }
 
+    /* Known Text Extensions */
+    int is_text = 0;
+    if ((len >= 4 && str_cmp(f->name + len - 4, ".txt") == 0) ||
+        (len >= 2 && str_cmp(f->name + len - 2, ".h") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".asm") == 0) ||
+        (len >= 3 && str_cmp(f->name + len - 3, ".md") == 0) ||
+        (len >= 5 && str_cmp(f->name + len - 5, ".conf") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".cfg") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".ini") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".log") == 0) ||
+        (len >= 3 && str_cmp(f->name + len - 3, ".sh") == 0) ||
+        (len >= 5 && str_cmp(f->name + len - 5, ".json") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".csv") == 0) ||
+        (len >= 4 && str_cmp(f->name + len - 4, ".xml") == 0)) {
+        is_text = 1;
+    }
+
+    /* Content-based text sniffing for extensionless files (e.g. "new", "general", "README", "Makefile") */
+    if (!is_text && is_text_content((const char *)f->data, f->size)) {
+        is_text = 1;
+    }
+
+    if (is_text) {
+        str_cpy(notepad_filename, f->name, 32);
+        notepad_len = 0;
+        notepad_scroll = 0;
+        if (f->data) {
+            for (size_t k = 0; k < f->size && k < NOTEPAD_BUF_MAX - 1; k++) notepad_buf[k] = f->data[k];
+            notepad_len = (int)(f->size < NOTEPAD_BUF_MAX - 1 ? f->size : NOTEPAD_BUF_MAX - 1);
+        }
+        notepad_buf[notepad_len] = '\0';
+        windows[4].visible = 1;
+        windows[4].minimized = 0;
+        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
+        focused_win = 4;
+        windows[4].focused = 1;
+        windows[4].open_tick = pit_ticks();
+        sound_win_open();
+        return;
+    }
+
+    /* Check for magic bytes: BMP */
+    if (f->data && f->size >= 2 && f->data[0] == 'B' && f->data[1] == 'M') {
+        gui_load_image(f);
         windows[7].visible = 1;
         windows[7].minimized = 0;
         windows[7].open_tick = pit_ticks();
@@ -4564,62 +7284,25 @@ static void open_associated_file(fs_node_t *f) {
         focused_win = 7;
         windows[7].focused = 1;
         sound_win_open();
+        return;
     }
-    /* Audio & Video files -> Web Browser In-Browser Media Player */
-    else if (len >= 4 && (str_cmp(f->name + len - 4, ".ogg") == 0 ||
-                          str_cmp(f->name + len - 4, ".mp3") == 0 ||
-                          str_cmp(f->name + len - 4, ".wav") == 0 ||
-                          str_cmp(f->name + len - 4, ".gif") == 0 ||
-                          str_cmp(f->name + len - 4, ".vid") == 0 ||
-                          str_cmp(f->name + len - 4, ".mpg") == 0 ||
-                          str_cmp(f->name + len - 4, ".mp4") == 0)) {
-        windows[12].visible = 1;
-        windows[12].minimized = 0;
-        if (focused_win >= 0 && focused_win < win_count) windows[focused_win].focused = 0;
-        focused_win = 12;
-        windows[12].focused = 1;
-        windows[12].open_tick = pit_ticks();
-        sound_win_open();
-        browser_fetch(f->name);
-    }
-    else {
-        show_toast("Unknown file type!", TOAST_ERR);
-        sound_error();
-    }
+
+    show_toast("Unknown file type!", TOAST_ERR);
+    sound_error();
 }
 
 static int caps_lock_state = 0;
 
-/* Shift & Caps Lock Key Scancode Conversion Table */
 static char scancode_to_ascii(uint8_t sc, int shift) {
-    if (sc >= 128) return 0;
-    static const char map_lower[128] = {
-        0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b',
-        '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
-        'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',
-        'z','x','c','v','b','n','m',',','.','/',0,'*',0,' '
-    };
-    static const char map_upper[128] = {
-        0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
-        '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
-        'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
-        'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' '
-    };
-    char lower_c = map_lower[sc];
-    if (lower_c >= 'a' && lower_c <= 'z') {
-        int is_upper = shift ^ caps_lock_state;
-        return is_upper ? map_upper[sc] : map_lower[sc];
-    }
-    return shift ? map_upper[sc] : map_lower[sc];
+    return keyboard_scancode_to_ascii(sc, shift, caps_lock_state);
 }
 
-/* ============================================================
- * HELPER: open a window by index, set focus, play sound
- * ============================================================ */
+
 static void open_window(int idx) {
     if (idx < 0 || idx >= win_count) return;
     windows[idx].visible = 1;
     windows[idx].minimized = 0;
+    windows[idx].workspace = gui_active_workspace;
     windows[idx].open_tick = pit_ticks();
     if (focused_win >= 0 && focused_win < win_count)
         windows[focused_win].focused = 0;
@@ -4725,29 +7408,51 @@ static void init_vfs_media_assets(void) {
     fs_write("video_thumb.bmp", (const char *)tbmp, 54 + timg_size);
 }
 
-/* ============================================================
- * MAIN GUI LOOP
- * ============================================================ */
+
 
 int gui_active = 0;
+static char gui_pending_open_file[64] = {0};
+
+void gui_set_pending_file(const char *path)
+{
+    if (path) str_cpy(gui_pending_open_file, path, 64);
+    else gui_pending_open_file[0] = '\0';
+}
 
 void gui_enter(void)
 {
     gui_active = 1;
     vga_font_backup_save(font_backup);
-    vga_set_mode13h();
+
+    if (!gui_force_vga && vesa_is_available()) {
+        gui_vesa_active = 1;
+        vesa_set_mode(800, 600, 32);
+        vesa_clear(0xFF0F172A);
+        vesa_draw_gradient_v(0, 0, 800, 75, 0xFF1E293B, 0xFF0F172A);
+        vesa_draw_gradient_v(0, 485, 800, 115, 0xFF0F172A, 0xFF1E293B);
+    } else {
+        gui_vesa_active = 0;
+        vga_set_mode13h();
+    }
     set_palette();
     /* mouse_init() already called at boot in idt_init() — no need to repeat */
 
     init_vfs_media_assets();
     win_init_all();
+
+    if (gui_pending_open_file[0]) {
+        fs_node_t *f = fs_resolve(gui_pending_open_file);
+        if (!f && gui_pending_open_file[0] == '/') f = fs_resolve(gui_pending_open_file + 1);
+        if (f) open_associated_file(f);
+        gui_pending_open_file[0] = '\0';
+    }
+
     int mx = mouse_x, my = mouse_y;
     int prev_mx = -1, prev_my = -1;
     uint8_t prev_lclick = 0, prev_rclick = 0;
 
     int dragging_win = -1;
     int drag_off_x = 0, drag_off_y = 0;
-    int shift_down = 0;
 
     redraw_all_frame(mx, my);
     uint32_t last_clock = pit_ticks();
@@ -4757,11 +7462,61 @@ void gui_enter(void)
         uint8_t current_exit_flag = 0;
         uint32_t now_ticks = pit_ticks();
 
+        /* Check if any game or interactive user window is actively running */
+        int game_active = 0;
+        for (int wi = 0; wi < win_count; wi++) {
+            if (windows[wi].visible && !windows[wi].minimized &&
+                (windows[wi].is_user_win || windows[wi].app == APP_USER_WIN || windows[wi].cursor_mode != 0)) {
+                game_active = 1;
+                break;
+            }
+        }
+
         /* Screensaver Idle Check */
-        if (!screensaver_active && (now_ticks - last_activity_tick >= SAVER_IDLE_MS)) {
+        int any_game_active = game_active;
+        if (!any_game_active) {
+            for (int wi = 0; wi < win_count; wi++) {
+                if (windows[wi].visible && !windows[wi].minimized) {
+                    if (windows[wi].is_user_win || windows[wi].app == APP_USER_WIN ||
+                        str_cmp(windows[wi].title, "DOOM") == 0 ||
+                        str_cmp(windows[wi].title, "ScummVM") == 0) {
+                        any_game_active = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (any_game_active) {
+            last_activity_tick = now_ticks;
+            if (screensaver_active) {
+                screensaver_active = 0;
+                redraw_all_frame(mouse_x, mouse_y);
+            }
+        } else if (!screensaver_active && (now_ticks - last_activity_tick >= SAVER_IDLE_MS)) {
             screensaver_active = 1;
             saver_init();
             redraw_all_frame(mouse_x, mouse_y);
+        }
+
+        /* Screensaver Animation Step (30 FPS = ~33ms) */
+        static uint32_t last_saver_tick = 0;
+        if (screensaver_active) {
+            if (now_ticks - last_saver_tick >= 33) {
+                last_saver_tick = now_ticks;
+                redraw_all_frame(mouse_x, mouse_y);
+            }
+        }
+
+        /* CoreView Live Telemetry Step (30 FPS = ~33ms) */
+        for (int wi = 0; wi < win_count; wi++) {
+            if (windows[wi].app == APP_COREVIEW && windows[wi].visible && !windows[wi].minimized) {
+                static uint32_t last_coreview_draw = 0;
+                if (now_ticks - last_coreview_draw >= 33) {
+                    last_coreview_draw = now_ticks;
+                    redraw_all_frame(mouse_x, mouse_y);
+                }
+                break;
+            }
         }
 
         /* Snake Timer Step */
@@ -4778,6 +7533,20 @@ void gui_enter(void)
         if (now_ticks - last_clock >= 1000 || (toast_visible && now_ticks >= toast_expire)) {
             last_clock = now_ticks;
             redraw_all_frame(mouse_x, mouse_y);
+        }
+
+        /* Periodic Application Hang Watchdog Check */
+        static uint32_t last_watchdog_poll = 0;
+        if (now_ticks - last_watchdog_poll >= 500) {
+            last_watchdog_poll = now_ticks;
+            char hung_name[32];
+            uint32_t hung_pid = 0;
+            if (!watchdog_modal_active && task_check_watchdog(hung_name, &hung_pid)) {
+                watchdog_modal_active = 1;
+                watchdog_hung_pid = hung_pid;
+                str_cpy(watchdog_hung_title, hung_name, 32);
+                redraw_all_frame(mouse_x, mouse_y);
+            }
         }
 
         /* 3-Second Auto Reset for Minesweeper on Loss */
@@ -4833,14 +7602,64 @@ void gui_enter(void)
             last_activity_tick = now_ticks;
         }
 
-        /* Right-Click Handling: Minesweeper Flagging OR Desktop Context Menu */
+        /* Developer Relative Cursor Mode & Mouse Motion Dispatch */
+        if (focused_win >= 0 && focused_win < win_count) {
+            gui_window_t *fw = &windows[focused_win];
+            if (fw->visible && !fw->minimized && fw->is_user_win) {
+                if (fw->cursor_mode == 2 && (mx != prev_mx || my != prev_my)) {
+                    int delta_x = mx - prev_mx;
+                    int delta_y = my - prev_my;
+                    if (delta_x != 0 || delta_y != 0) {
+                        gui_raw_event_t ev;
+                        ev.type = GUI_EVENT_MOUSE_MOVE;
+                        ev.c = 0;
+                        ev.scancode = 0;
+                        ev._pad[0] = ev._pad[1] = 0;
+                        ev.rx = delta_x;
+                        ev.ry = delta_y;
+                        ev.x = delta_x;
+                        ev.y = delta_y;
+                        ev.mx = mx;
+                        ev.my = my;
+                        ev.buttons = (lclick ? 1 : 0) | (rclick ? 2 : 0);
+                        gui_kernel_push_event(fw, &ev);
+
+                        /* Lock and re-center cursor inside window */
+                        int center_x = fw->x + fw->w / 2;
+                        int center_y = fw->y + fw->h / 2;
+                        mouse_x = center_x;
+                        mouse_y = center_y;
+                        prev_mx = center_x;
+                        prev_my = center_y;
+                        mx = center_x;
+                        my = center_y;
+                    }
+                } else if (user_win_mouse_down == focused_win && (mx != prev_mx || my != prev_my)) {
+                    /* Mouse drag inside user window */
+                    gui_raw_event_t ev;
+                    ev.type = GUI_EVENT_MOUSE_MOVE;
+                    ev.c = 0;
+                    ev.scancode = 0;
+                    ev._pad[0] = ev._pad[1] = 0;
+                    ev.rx = mx - prev_mx;
+                    ev.ry = my - prev_my;
+                    ev.x = mx - (fw->x + 1);
+                    ev.y = my - (fw->y + 12);
+                    ev.mx = mx;
+                    ev.my = my;
+                    ev.buttons = (lclick ? 1 : 0) | (rclick ? 2 : 0);
+                    gui_kernel_push_event(fw, &ev);
+                }
+            }
+        }
+
+        /* Right-Click Handling: Minesweeper Flagging OR Desktop Context Menu OR User Window */
         if (rclick && !prev_rclick) {
             int win_rclick = -1;
             if (focused_win >= 0 && focused_win < win_count) {
                 gui_window_t *w = &windows[focused_win];
                 if (w->visible && !w->minimized &&
-                    mx >= w->x && mx < w->x + w->w &&
-                    my >= w->y && my < w->y + w->h) {
+                    (w->cursor_mode == 2 || (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + w->h))) {
                     win_rclick = focused_win;
                 }
             }
@@ -4871,10 +7690,43 @@ void gui_enter(void)
                             }
                         }
                     redraw_all_frame(mx, my);
+                } else if (w->app == APP_USER_WIN || w->is_user_win) {
+                    gui_raw_event_t ev;
+                    ev.type = GUI_EVENT_MOUSE_DOWN;
+                    ev.c = 0;
+                    ev.scancode = 0;
+                    ev._pad[0] = ev._pad[1] = 0;
+                    ev.rx = (w->cursor_mode == 2) ? 0 : (mx - (w->x + 1));
+                    ev.ry = (w->cursor_mode == 2) ? 0 : (my - (w->y + 12));
+                    ev.x = ev.rx;
+                    ev.y = ev.ry;
+                    ev.mx = mx;
+                    ev.my = my;
+                    ev.buttons = 2;
+                    gui_kernel_push_event(w, &ev);
                 }
             } else if (my < TASKBAR_Y) {
                 /* Right-clicked on empty desktop area */
                 ctx_menu_open = 1; ctx_menu_x = mx; ctx_menu_y = my; sound_click(); redraw_all_frame(mx, my);
+            }
+        } else if (!rclick && prev_rclick) {
+            if (focused_win >= 0 && focused_win < win_count) {
+                gui_window_t *w = &windows[focused_win];
+                if (w->visible && !w->minimized && (w->app == APP_USER_WIN || w->is_user_win)) {
+                    gui_raw_event_t ev;
+                    ev.type = GUI_EVENT_MOUSE_UP;
+                    ev.c = 0;
+                    ev.scancode = 0;
+                    ev._pad[0] = ev._pad[1] = 0;
+                    ev.rx = (w->cursor_mode == 2) ? 0 : (mx - (w->x + 1));
+                    ev.ry = (w->cursor_mode == 2) ? 0 : (my - (w->y + 12));
+                    ev.x = ev.rx;
+                    ev.y = ev.ry;
+                    ev.mx = mx;
+                    ev.my = my;
+                    ev.buttons = 0;
+                    gui_kernel_push_event(w, &ev);
+                }
             }
         }
 
@@ -4883,6 +7735,36 @@ void gui_enter(void)
         {
             if (lclick && !prev_lclick)
             {
+                /* Watchdog Modal Click Processing */
+                if (watchdog_modal_active) {
+                    int ww = 210, wh = 66;
+                    int wx = (SCREEN_W - ww) / 2;
+                    int wy = (SCREEN_H - wh) / 2;
+
+                    /* [ Wait ] Button: wx+25, wy+44, w=60, h=14 */
+                    if (mx >= wx + 25 && mx <= wx + 85 && my >= wy + 44 && my <= wy + 58) {
+                        task_watchdog_extend(watchdog_hung_pid);
+                        watchdog_modal_active = 0;
+                        sound_click();
+                        redraw_all_frame(mx, my);
+                    }
+                    /* [ Force Quit ] Button: wx+105, wy+44, w=75, h=14 */
+                    else if (mx >= wx + 105 && mx <= wx + 180 && my >= wy + 44 && my <= wy + 58) {
+                        task_kill(watchdog_hung_pid);
+                        for (int wi = 0; wi < win_count; wi++) {
+                            if (str_cmp(windows[wi].title, watchdog_hung_title) == 0 ||
+                                str_cmp(windows[wi].short_title, watchdog_hung_title) == 0) {
+                                windows[wi].visible = 0;
+                            }
+                        }
+                        watchdog_modal_active = 0;
+                        sound_click();
+                        show_toast("Terminated unresponsive task", TOAST_INFO);
+                        redraw_all_frame(mx, my);
+                    }
+                    continue;
+                }
+
                 /* Dismiss Toast on Click */
                 if (toast_visible) toast_visible = 0;
 
@@ -4915,18 +7797,19 @@ void gui_enter(void)
                     sound_click();
                 }
                 /* ProcessBar Window Tab Click */
-                else if (my >= TASKBAR_Y && mx >= 58 && mx < 263) {
+                else if (my >= TASKBAR_Y && mx >= 58 && mx < 234) {
                     int open_cnt = 0;
-                    for (int i = 0; i < win_count; i++) if (windows[i].visible) open_cnt++;
+                    for (int i = 0; i < win_count; i++)
+                        if (windows[i].visible && windows[i].workspace == gui_active_workspace) open_cnt++;
 
                     if (open_cnt > 0) {
-                        int btn_w = 205 / open_cnt;
+                        int btn_w = 175 / open_cnt;
                         if (btn_w > 75) btn_w = 75;
                         int idx = (mx - 58) / btn_w;
 
                         int cur = 0;
                         for (int i = 0; i < win_count; i++) {
-                            if (windows[i].visible) {
+                            if (windows[i].visible && windows[i].workspace == gui_active_workspace) {
                                 if (cur == idx) {
                                     if (focused_win == i && !windows[i].minimized) {
                                         windows[i].minimized = 1;
@@ -4946,9 +7829,20 @@ void gui_enter(void)
                         }
                     }
                 }
+                /* Workspace Pager Clicks */
+                else if (my >= TASKBAR_Y && mx >= 236 && mx <= 248) {
+                    gui_active_workspace = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                }
+                else if (my >= TASKBAR_Y && mx >= 251 && mx <= 263) {
+                    gui_active_workspace = 1;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                }
                 /* Start Menu Item Click */
-                else if (start_menu_open && mx >= 2 && mx <= 117 && my >= 26 && my < 26 + 160) {
-                    int item = (my - 26) / 12;
+                else if (start_menu_open && mx >= 2 && mx <= 154 && my >= 16 && my < 16 + 154) {
+                    int item = (my - 16) / 11;
                     start_menu_open = 0;
                     if (item >= 0 && item < 13) {
                         static const int menu_to_win[13] = {
@@ -4958,6 +7852,15 @@ void gui_enter(void)
                         open_window(win_idx);
                         if (item == 2) minesweeper_reset();
                         if (item == 8) snake_reset();
+                    } else if (item == 13) {
+                        /* Run Program... — prompt for any /bin ELF path */
+                        char run_path[64];
+                        gui_prompt_user_input("Run program or ELF path:", run_path, sizeof(run_path));
+                        if (run_path[0]) {
+                            char resolved[FS_MAX_PATH];
+                            resolve_elf_path(run_path, resolved, sizeof(resolved));
+                            launch_elf_app(resolved);
+                        }
                     }
                 }
                 else
@@ -4969,7 +7872,7 @@ void gui_enter(void)
                     /* First check focused window for priority */
                     if (focused_win >= 0 && focused_win < win_count) {
                         gui_window_t *w = &windows[focused_win];
-                        if (w->visible && !w->minimized &&
+                        if (w->visible && !w->minimized && w->workspace == gui_active_workspace &&
                             mx >= w->x && mx < w->x + w->w &&
                             my >= w->y && my < w->y + w->h) {
                             clicked = focused_win;
@@ -4980,7 +7883,7 @@ void gui_enter(void)
                         for (int i = 0; i < win_count; i++) {
                             if (i == focused_win) continue;
                             gui_window_t *w = &windows[i];
-                            if (w->visible && !w->minimized &&
+                            if (w->visible && !w->minimized && w->workspace == gui_active_workspace &&
                                 mx >= w->x && mx < w->x + w->w &&
                                 my >= w->y && my < w->y + w->h) {
                                 clicked = i; break;
@@ -4991,7 +7894,7 @@ void gui_enter(void)
                     if (clicked < 0) {
                         int icon_clicked = -1;
                         int slot = 0;
-                        for (int i = 0; i < win_count; i++) {
+                        for (int i = 0; i < 14 && i < win_count; i++) {
                             int ix, iy;
                             get_desktop_slot_pos(slot++, &ix, &iy);
                             if (mx >= ix - 2 && mx <= ix + 42 && my >= iy - 2 && my <= iy + 28) {
@@ -5001,12 +7904,8 @@ void gui_enter(void)
                         }
 
                         int file_clicked = -1;
-                        fs_node_t *root = fs_root();
-                        if (icon_clicked < 0 && root) {
-                            for (int i = 0; i < root->child_count && slot < 18; i++) {
-                                fs_node_t *f = root->children[i];
-                                if (!f || f->type != FS_FILE) continue;
-                                if (f->name[0] == '.' || str_cmp(f->name, "tmp_pipe") == 0) continue;
+                        if (icon_clicked < 0 && desktop_file_count > 0) {
+                            for (int i = 0; i < desktop_file_count && slot < 24; i++) {
                                 int ix, iy;
                                 get_desktop_slot_pos(slot++, &ix, &iy);
                                 if (mx >= ix - 2 && mx <= ix + 42 && my >= iy - 2 && my <= iy + 28) {
@@ -5026,10 +7925,10 @@ void gui_enter(void)
                                 selected_desktop_icon = icon_clicked;
                                 sound_click();
                             }
-                        } else if (file_clicked >= 0 && root) {
+                        } else if (file_clicked >= 0 && file_clicked < desktop_file_count) {
                             selected_desktop_icon = -1;
                             if (selected_desktop_file == file_clicked) {
-                                open_associated_file(root->children[file_clicked]);
+                                open_associated_file(desktop_files[file_clicked]);
                                 selected_desktop_file = -1;
                             } else {
                                 selected_desktop_file = file_clicked;
@@ -5051,7 +7950,11 @@ void gui_enter(void)
 
                         /* Close button X */
                         if (mx >= w->x + w->w - 8 && mx <= w->x + w->w - 1 && my >= w->y + 2 && my <= w->y + 10) {
-                            w->visible = 0;
+                            if (w->app == APP_USER_WIN || w->is_user_win) {
+                                gui_kernel_close_window(clicked);
+                            } else {
+                                w->visible = 0;
+                            }
                             sound_win_close();
                         }
                         /* Maximize button = */
@@ -5115,9 +8018,35 @@ void gui_enter(void)
                                 }
                             }
                         }
-                        /* ====================================================
-                         * APP INTERACTIONS
-                         * ==================================================== */
+                        else if (w->app == APP_USER_WIN || w->is_user_win) {
+                            int client_x = w->x + 1;
+                            int client_y = w->y + 12;
+                            int max_cw = w->w - 2;
+                            int max_ch = w->h - 13;
+                            if (max_cw < 0) max_cw = 0;
+                            if (max_ch < 0) max_ch = 0;
+                            int client_w = (w->client_w < max_cw) ? w->client_w : max_cw;
+                            int client_h = (w->client_h < max_ch) ? w->client_h : max_ch;
+                            if (w->cursor_mode == 2 || (mx >= client_x && mx < client_x + client_w &&
+                                my >= client_y && my < client_y + client_h)) {
+                                int rx = (w->cursor_mode == 2) ? 0 : (mx - client_x);
+                                int ry = (w->cursor_mode == 2) ? 0 : (my - client_y);
+                                gui_raw_event_t ev;
+                                ev.type = GUI_EVENT_MOUSE_DOWN;
+                                ev.c = 0;
+                                ev.scancode = 0;
+                                ev._pad[0] = ev._pad[1] = 0;
+                                ev.rx = rx;
+                                ev.ry = ry;
+                                ev.x = rx;
+                                ev.y = ry;
+                                ev.mx = mx;
+                                ev.my = my;
+                                ev.buttons = 1;
+                                gui_kernel_push_event(w, &ev);
+                                user_win_mouse_down = clicked;
+                            }
+                        }
                         else if (w->app == APP_CALC) {
                             for (int r = 0; r < 4; r++)
                                 for (int c = 0; c < 4; c++) {
@@ -5155,19 +8084,19 @@ void gui_enter(void)
                         else if (w->app == APP_PAINTER) {
                             int tb_y = w->y + 13;
                             /* Clear */
-                            if (mx >= w->x + 4 && mx <= w->x + 28 && my >= tb_y && my <= tb_y + 11) {
+                            if (mx >= w->x + 4 && mx <= w->x + 20 && my >= tb_y && my <= tb_y + 11) {
                                 for (int i=0; i<PAINT_CW*PAINT_CH; i++) paint_canvas[i] = COL_WHITE;
                                 show_toast("Canvas cleared.", TOAST_INFO);
                                 sound_clear();
                             }
                             /* Save */
-                            else if (mx >= w->x + 30 && mx <= w->x + 54 && my >= tb_y && my <= tb_y + 11) {
+                            else if (mx >= w->x + 22 && mx <= w->x + 38 && my >= tb_y && my <= tb_y + 11) {
                                 fs_write(paint_filename, (const char*)paint_canvas, PAINT_CW * PAINT_CH);
                                 show_toast("Saved!", TOAST_OK);
                                 sound_save();
                             }
                             /* Open */
-                            else if (mx >= w->x + 56 && mx <= w->x + 80 && my >= tb_y && my <= tb_y + 11) {
+                            else if (mx >= w->x + 40 && mx <= w->x + 56 && my >= tb_y && my <= tb_y + 11) {
                                 fs_node_t *f = fs_resolve(paint_filename);
                                 if (f && f->data) {
                                     size_t sz = f->size < (size_t)(PAINT_CW * PAINT_CH) ? f->size : (size_t)(PAINT_CW * PAINT_CH);
@@ -5179,21 +8108,18 @@ void gui_enter(void)
                                     sound_error();
                                 }
                             }
-                            /* Pencil */
-                            else if (mx >= w->x + 85 && mx <= w->x + 109 && my >= tb_y && my <= tb_y + 11) {
-                                paint_brush_size = 1; paint_eraser = 0; paint_fill = 0; sound_click();
-                            }
-                            /* Brush */
-                            else if (mx >= w->x + 111 && mx <= w->x + 135 && my >= tb_y && my <= tb_y + 11) {
-                                paint_brush_size = 3; paint_eraser = 0; paint_fill = 0; sound_click();
-                            }
-                            /* Eraser */
-                            else if (mx >= w->x + 137 && mx <= w->x + 161 && my >= tb_y && my <= tb_y + 11) {
-                                paint_eraser = 1; paint_fill = 0; sound_click();
-                            }
-                            /* Fill */
-                            else if (mx >= w->x + 163 && mx <= w->x + 187 && my >= tb_y && my <= tb_y + 11) {
-                                paint_fill = 1; paint_eraser = 0; sound_click();
+                            /* 9 Tools */
+                            else if (mx >= w->x + 62 && mx < w->x + 62 + 9 * 11 && my >= tb_y && my <= tb_y + 11) {
+                                int tidx = (mx - (w->x + 62)) / 11;
+                                if (tidx >= 0 && tidx < 9) {
+                                    paint_active_tool = tidx;
+                                    if (tidx == PTOOL_PENCIL) { paint_brush_size = 1; paint_eraser = 0; paint_fill = 0; }
+                                    else if (tidx == PTOOL_BRUSH) { paint_brush_size = 3; paint_eraser = 0; paint_fill = 0; }
+                                    else if (tidx == PTOOL_ERASER) { paint_eraser = 1; paint_fill = 0; }
+                                    else if (tidx == PTOOL_FILL) { paint_fill = 1; paint_eraser = 0; }
+                                    else { paint_eraser = 0; paint_fill = 0; }
+                                    sound_click();
+                                }
                             }
                             /* Color Palette */
                             else {
@@ -5205,6 +8131,7 @@ void gui_enter(void)
                                     if (pidx >= 0 && pidx < PAINT_PALETTE_COUNT) {
                                         paint_color = PAINT_PALETTE[pidx];
                                         paint_eraser = 0;
+                                        if (paint_active_tool == PTOOL_ERASER) paint_active_tool = PTOOL_PENCIL;
                                         sound_color_pick();
                                     }
                                     prev_paint_x = -1; prev_paint_y = -1;
@@ -5410,8 +8337,7 @@ void gui_enter(void)
                             else if (mx >= w->x + 34 && mx <= w->x + 62 && my >= tb_y && my <= tb_y + 11) {
                                 fs_node_t *f = fs_resolve(imgview_filename);
                                 if (f && f->data) {
-                                    size_t sz = f->size < (size_t)(PAINT_CW * PAINT_CH) ? f->size : (size_t)(PAINT_CW * PAINT_CH);
-                                    for (size_t i = 0; i < sz; i++) paint_canvas[i] = (uint8_t)f->data[i];
+                                    gui_load_image(f);
                                     show_toast("Image opened!", TOAST_OK);
                                     sound_open();
                                 } else {
@@ -5421,6 +8347,9 @@ void gui_enter(void)
                             }
                             /* Rst (Reset / show demo landscape) */
                             else if (mx >= w->x + 64 && mx <= w->x + 92 && my >= tb_y && my <= tb_y + 11) {
+                                imgview_has_image = 0;
+                                imgview_width = 0;
+                                imgview_height = 0;
                                 for (int i=0; i<PAINT_CW*PAINT_CH; i++) paint_canvas[i] = COL_WHITE;
                                 show_toast("View reset.", TOAST_INFO);
                                 sound_clear();
@@ -5801,8 +8730,8 @@ void gui_enter(void)
                             }
                         }
 
-                        else if (w->app == APP_AI_CHAT) {
-                            handle_ai_chat_click(w, mx, my);
+                        else if (w->app == APP_COREVIEW) {
+                            handle_coreview_click(w, mx, my);
                             redraw_all_frame(mx, my);
                         }
                     }
@@ -5833,15 +8762,26 @@ void gui_enter(void)
                     int cur_py = ((my - (cy + 1)) * PAINT_CH) / draw_h;
                     if (cur_px >= PAINT_CW) cur_px = PAINT_CW - 1;
                     if (cur_py >= PAINT_CH) cur_py = PAINT_CH - 1;
-                    if (paint_fill) {
+                    if (paint_active_tool == PTOOL_PICKER) {
+                        paint_color = paint_canvas[cur_py * PAINT_CW + cur_px];
+                        paint_active_tool = PTOOL_PENCIL;
+                        sound_color_pick();
+                    } else if (paint_active_tool == PTOOL_FILL) {
                         if (!prev_lclick) {
                             paint_flood_fill(cur_px, cur_py, paint_color);
                             sound_click();
                         }
-                    } else if (prev_paint_x >= 0 && prev_paint_y >= 0) {
-                        draw_paint_line(prev_paint_x, prev_paint_y, cur_px, cur_py, paint_color);
+                    } else if (paint_active_tool >= PTOOL_LINE && paint_active_tool <= PTOOL_CIRCLE) {
+                        if (!prev_lclick) {
+                            paint_shape_start_x = cur_px;
+                            paint_shape_start_y = cur_py;
+                        }
                     } else {
-                        draw_paint_spot(cur_px, cur_py, paint_color);
+                        if (prev_paint_x >= 0 && prev_paint_y >= 0) {
+                            draw_paint_line(prev_paint_x, prev_paint_y, cur_px, cur_py, paint_color);
+                        } else {
+                            draw_paint_spot(cur_px, cur_py, paint_color);
+                        }
                     }
                     prev_paint_x = cur_px;
                     prev_paint_y = cur_py;
@@ -5851,6 +8791,69 @@ void gui_enter(void)
             }
             else if (!lclick)
             {
+                if (prev_lclick) {
+                    if (paint_shape_start_x >= 0 && focused_win == 1) {
+                        if (prev_paint_x >= 0 && prev_paint_y >= 0) {
+                            if (paint_active_tool == PTOOL_LINE) {
+                                draw_paint_line(paint_shape_start_x, paint_shape_start_y, prev_paint_x, prev_paint_y, paint_color);
+                            } else if (paint_active_tool == PTOOL_RECT) {
+                                draw_paint_rect(paint_shape_start_x, paint_shape_start_y, prev_paint_x, prev_paint_y, paint_color, 0);
+                            } else if (paint_active_tool == PTOOL_BOX) {
+                                draw_paint_rect(paint_shape_start_x, paint_shape_start_y, prev_paint_x, prev_paint_y, paint_color, 1);
+                            } else if (paint_active_tool == PTOOL_CIRCLE) {
+                                int dx = prev_paint_x - paint_shape_start_x;
+                                int dy = prev_paint_y - paint_shape_start_y;
+                                int r = 0;
+                                int r2 = dx * dx + dy * dy;
+                                while ((r + 1) * (r + 1) <= r2) r++;
+                                draw_paint_circle(paint_shape_start_x, paint_shape_start_y, r, paint_color);
+                            }
+                            sound_click();
+                        }
+                        paint_shape_start_x = -1;
+                        paint_shape_start_y = -1;
+                    }
+                    if (user_win_mouse_down >= 0 && user_win_mouse_down < MAX_WINDOWS) {
+                        gui_window_t *w = &windows[user_win_mouse_down];
+                        if (w->visible && (w->app == APP_USER_WIN || w->is_user_win)) {
+                            int rx = (w->cursor_mode == 2) ? 0 : (mx - (w->x + 1));
+                            int ry = (w->cursor_mode == 2) ? 0 : (my - (w->y + 12));
+                            gui_raw_event_t ev;
+                            ev.type = GUI_EVENT_MOUSE_UP;
+                            ev.c = 0;
+                            ev.scancode = 0;
+                            ev._pad[0] = ev._pad[1] = 0;
+                            ev.rx = rx;
+                            ev.ry = ry;
+                            ev.x = rx;
+                            ev.y = ry;
+                            ev.mx = mx;
+                            ev.my = my;
+                            ev.buttons = 0;
+                            gui_kernel_push_event(w, &ev);
+                        }
+                    } else if (focused_win >= 0 && focused_win < MAX_WINDOWS) {
+                        gui_window_t *w = &windows[focused_win];
+                        if (w->visible && (w->app == APP_USER_WIN || w->is_user_win)) {
+                            int rx = (w->cursor_mode == 2) ? 0 : (mx - (w->x + 1));
+                            int ry = (w->cursor_mode == 2) ? 0 : (my - (w->y + 12));
+                            gui_raw_event_t ev;
+                            ev.type = GUI_EVENT_MOUSE_UP;
+                            ev.c = 0;
+                            ev.scancode = 0;
+                            ev._pad[0] = ev._pad[1] = 0;
+                            ev.rx = rx;
+                            ev.ry = ry;
+                            ev.x = rx;
+                            ev.y = ry;
+                            ev.mx = mx;
+                            ev.my = my;
+                            ev.buttons = 0;
+                            gui_kernel_push_event(w, &ev);
+                        }
+                    }
+                    user_win_mouse_down = -1;
+                }
                 if (dragging_win >= 0) {
                     gui_window_t *w = &windows[dragging_win];
                     /* Window Snapping Edge Detection */
@@ -5932,6 +8935,19 @@ void gui_enter(void)
                 } else {
                     gui_cursor_type = 0;
                 }
+            } else if (focused_win >= 0 && windows[focused_win].app == APP_COREVIEW && windows[focused_win].visible && !windows[focused_win].minimized) {
+                gui_window_t *cw = &windows[focused_win];
+                int tab_y = cw->y + 14;
+                int tab_w = (cw->w - 8) / 3;
+                if (my >= tab_y && my <= tab_y + 12 && mx >= cw->x + 4 && mx < cw->x + 4 + 3 * tab_w) {
+                    gui_cursor_type = 1; /* Tabs -> Hand */
+                } else if (my >= cw->y + 24 && my <= cw->y + 35 && mx >= cw->x + 4 && mx <= cw->x + 265) {
+                    gui_cursor_type = 1; /* Spectrum Bar -> Hand */
+                } else if (coreview_gui_tab == 1 && my >= cw->y + 36 && my <= cw->y + 50 && mx >= cw->x + 110 && mx <= cw->x + 268) {
+                    gui_cursor_type = 1; /* RAM Navigation/preset buttons -> Hand */
+                } else {
+                    gui_cursor_type = 0;
+                }
             } else {
                 gui_cursor_type = 0;
             }
@@ -5962,36 +8978,157 @@ void gui_enter(void)
             }
         }
 
-        uint8_t kbd_status = inb(0x64);
-        if (!irq_kbd_fired && (kbd_status & 0x01) && !(kbd_status & 0x20)) {
-            last_scancode = inb(0x60);
-            irq_kbd_fired = 1;
+        /* Periodic CoreView Silicon Monitor Live Step (~30 FPS = 33ms) */
+        static uint32_t last_coreview_step = 0;
+        bool coreview_is_open = false;
+        for (int wi = 0; wi < win_count; wi++) {
+            if (windows[wi].app == APP_COREVIEW && windows[wi].visible && !windows[wi].minimized) {
+                coreview_is_open = true;
+                break;
+            }
+        }
+        if (coreview_is_open && (now_ticks - last_coreview_step >= 33)) {
+            last_coreview_step = now_ticks;
+            redraw_all_frame(mx, my);
         }
 
-        if (irq_kbd_fired) {
-            uint8_t sc = last_scancode;
+        if (!kbd_has_scancode()) {
+            uint8_t kbd_status = inb(0x64);
+            if ((kbd_status & 0x01) && !(kbd_status & 0x20)) {
+                uint8_t raw = inb(0x60);
+                keyboard_handle_scancode(raw);
+                if (raw != 0xE0) {
+                    kbd_push_scancode(raw);
+                }
+            }
+        }
+
+        uint8_t sc = 0;
+        while (kbd_pop_scancode(&sc)) {
             irq_kbd_fired = 0;
 
             if (screensaver_active) {
+                if (sc == 0x39 || sc == 0x0F) { /* Space or Tab cycles screensaver */
+                    screensaver_mode = (screensaver_mode + 1) % 3;
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
                 screensaver_active = 0;
                 redraw_all_frame(mx, my);
+                continue;
             }
             last_activity_tick = now_ticks;
 
-            static int ctrl_down = 0;
-            static int alt_down = 0;
-            if (sc == 0x2A || sc == 0x36) shift_down = 1;
-            else if (sc == 0xAA || sc == 0xB6) shift_down = 0;
-            else if (sc == 0x3A) { caps_lock_state = !caps_lock_state; sound_click(); }
-            else if (sc == 0x1D) ctrl_down = 1;
-            else if (sc == 0x9D) ctrl_down = 0;
-            else if (sc == 0x38) alt_down = 1;
-            else if (sc == 0xB8) alt_down = 0;
+            /* Watchdog Modal Keyboard Interaction */
+            if (watchdog_modal_active) {
+                if (sc == 0x01 || sc == 0x11) { /* ESC or 'W': Wait */
+                    task_watchdog_extend(watchdog_hung_pid);
+                    watchdog_modal_active = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x1C || sc == 0x21 || sc == 0x10) { /* Enter, 'F', or 'Q': Force Quit */
+                    task_kill(watchdog_hung_pid);
+                    for (int wi = 0; wi < win_count; wi++) {
+                        if (str_cmp(windows[wi].title, watchdog_hung_title) == 0 ||
+                            str_cmp(windows[wi].short_title, watchdog_hung_title) == 0) {
+                            windows[wi].visible = 0;
+                        }
+                    }
+                    watchdog_modal_active = 0;
+                    sound_click();
+                    show_toast("Terminated unresponsive task", TOAST_INFO);
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
+                continue;
+            }
+
+            int is_release = (sc & 0x80) ? 1 : 0;
+            uint8_t raw_sc = sc & 0x7F;
+
+            int shift_down = keyboard_is_shift();
+            int ctrl_down  = keyboard_is_ctrl();
+            int alt_down   = keyboard_is_alt();
+
+            /* Alt+Space: Toggle QuickRunner Spotlight */
+            if (alt_down && raw_sc == 0x39 && !is_release) {
+                quickrunner_active = !quickrunner_active;
+                qr_input[0] = '\0';
+                qr_input_len = 0;
+                qr_result[0] = '\0';
+                qr_match_win = -1;
+                sound_click();
+                redraw_all_frame(mx, my);
+                continue;
+            }
+
+            /* QuickRunner Modal Keyboard Interaction */
+            if (quickrunner_active && !is_release) {
+                if (raw_sc == 0x01) { /* Esc: Close */
+                    quickrunner_active = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (raw_sc == 0x1C) { /* Enter: Launch App or confirm */
+                    if (qr_match_win >= 0) {
+                        open_window(qr_match_win);
+                    }
+                    quickrunner_active = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (raw_sc == 0x0E) { /* Backspace */
+                    if (qr_input_len > 0) {
+                        qr_input[--qr_input_len] = '\0';
+                        qr_update_search();
+                        redraw_all_frame(mx, my);
+                    }
+                    continue;
+                } else {
+                    char ascii = keyboard_scancode_to_ascii(sc, shift_down, caps_lock_state);
+                    if (ascii >= 32 && ascii <= 126 && qr_input_len < 60) {
+                        qr_input[qr_input_len++] = ascii;
+                        qr_input[qr_input_len] = '\0';
+                        qr_update_search();
+                        redraw_all_frame(mx, my);
+                        continue;
+                    }
+                }
+                continue;
+            }
+
+            /* Dual Workspace Keyboard Shortcuts: Ctrl+1, Ctrl+2, Ctrl+Tab */
+            if (ctrl_down && !is_release) {
+                if (raw_sc == 0x02) { /* Ctrl + 1 */
+                    gui_active_workspace = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (raw_sc == 0x03) { /* Ctrl + 2 */
+                    gui_active_workspace = 1;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (raw_sc == 0x0F) { /* Ctrl + Tab */
+                    gui_active_workspace = !gui_active_workspace;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
+            }
+
+            if (!is_release && raw_sc == 0x3A) { caps_lock_state = !caps_lock_state; sound_click(); }
 
             clipboard_check_serial_input();
 
+            /* Emergency Global Exit: Shift+Esc directly quits GUI */
+            if (raw_sc == 0x01 && shift_down && !is_release) {
+                break;
+            }
+
             /* Alt+Tab: Cycle Window Focus */
-            if (alt_down && sc == 0x0F) {
+            if (alt_down && raw_sc == 0x0F && !is_release) {
                 int next_win = (focused_win + 1) % win_count;
                 int checked = 0;
                 while (checked < win_count) {
@@ -6007,6 +9144,47 @@ void gui_enter(void)
                     next_win = (next_win + 1) % win_count;
                     checked++;
                 }
+                continue;
+            }
+
+            /* Global Window Close (Alt+F4) */
+            if (alt_down && raw_sc == 0x3E && !is_release) {
+                if (focused_win >= 0 && focused_win < win_count && windows[focused_win].visible) {
+                    windows[focused_win].visible = 0;
+                    windows[focused_win].focused = 0;
+                    focused_win = -1;
+                    redraw_all_frame(mx, my);
+                }
+                continue;
+            }
+
+            int is_user_app_focused = (focused_win >= 0 && focused_win < win_count &&
+                                       (windows[focused_win].app == APP_USER_WIN || windows[focused_win].is_user_win) &&
+                                       windows[focused_win].visible && !windows[focused_win].minimized);
+
+            /* User Application Window: All game keys (Enter, Esc, Space, WASD, Arrows, Ctrl, Alt, Numbers) go straight to the app! */
+            if (is_user_app_focused) {
+                gui_window_t *w = &windows[focused_win];
+                char ch = is_release ? 0 : scancode_to_ascii(raw_sc, shift_down);
+                gui_raw_event_t ev;
+                ev.type = is_release ? GUI_EVENT_KEY_UP : GUI_EVENT_KEY_DOWN;
+                ev.c = ch;
+                ev.scancode = raw_sc;
+                ev._pad[0] = ev._pad[1] = 0;
+                ev.rx = 0;
+                ev.ry = 0;
+                ev.x = 0;
+                ev.y = 0;
+                ev.mx = mx;
+                ev.my = my;
+                ev.buttons = 0;
+                gui_kernel_push_event(w, &ev);
+                redraw_all_frame(mx, my);
+                continue;
+            }
+
+            /* For desktop shortcuts, ignore release events */
+            if (is_release) {
                 continue;
             }
 
@@ -6100,20 +9278,32 @@ void gui_enter(void)
             if (start_menu_open) {
                 if (sc == 0x48) { /* Up Arrow */
                     if (start_menu_selected_idx > 0) start_menu_selected_idx--;
-                    else start_menu_selected_idx = 12;
+                    else start_menu_selected_idx = 13;
                     redraw_all_frame(mx, my);
                     continue;
                 } else if (sc == 0x50) { /* Down Arrow */
-                    if (start_menu_selected_idx < 12) start_menu_selected_idx++;
+                    if (start_menu_selected_idx < 13) start_menu_selected_idx++;
                     else start_menu_selected_idx = 0;
                     redraw_all_frame(mx, my);
                     continue;
                 } else if (sc == 0x1C) { /* Enter */
-                    static const int menu_to_win[13] = {
-                        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13
-                    };
                     if (start_menu_selected_idx >= 0 && start_menu_selected_idx < 13) {
+                        static const int menu_to_win[13] = {
+                            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13
+                        };
                         open_window(menu_to_win[start_menu_selected_idx]);
+                    } else if (start_menu_selected_idx == 13) {
+                        /* Run Program... — prompt for any /bin ELF path */
+                        start_menu_open = 0;
+                        redraw_all_frame(mx, my);
+                        char run_path[64];
+                        gui_prompt_user_input("Run program or ELF path:", run_path, sizeof(run_path));
+                        if (run_path[0]) {
+                            char resolved[FS_MAX_PATH];
+                            resolve_elf_path(run_path, resolved, sizeof(resolved));
+                            launch_elf_app(resolved);
+                        }
+                        continue;
                     }
                     start_menu_open = 0;
                     redraw_all_frame(mx, my);
@@ -6125,10 +9315,109 @@ void gui_enter(void)
                 }
             }
 
+            if (focused_win >= 0 && windows[focused_win].app == APP_COREVIEW && windows[focused_win].visible && !windows[focused_win].minimized) {
+                if (sc == 0x01) { /* Escape: Close CoreView */
+                    windows[focused_win].visible = 0;
+                    windows[focused_win].focused = 0;
+                    focused_win = -1;
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x0F) { /* TAB: Next view */
+                    coreview_gui_tab = (coreview_gui_tab + 1) % 3;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc >= 0x02 && sc <= 0x0A) { /* '1'..'9': Activity Spectrum 1 to 9 */
+                    int lvl = sc - 1;
+                    coreview_set_active_level(lvl);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(lvl);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x0B) { /* '0': Activity Spectrum 0 (Quiescent Cold) */
+                    coreview_set_active_level(0);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(0);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x3B) { /* F1: CPU Regs */
+                    coreview_gui_tab = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x3C) { /* F2: RAM Waterfall */
+                    coreview_gui_tab = 1;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x3D) { /* F3: GPU Engine */
+                    coreview_gui_tab = 2;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x48 || sc == 0x49) { /* Up Arrow or Page Up */
+                    if (coreview_gui_ram_addr >= 128) coreview_gui_ram_addr -= 128;
+                    else coreview_gui_ram_addr = 0;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x50 || sc == 0x51) { /* Down Arrow or Page Down */
+                    coreview_gui_ram_addr += 128;
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x39) { /* Space: Pause / Resume */
+                    coreview_toggle_pause();
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x20) { /* 'D': Jump to Data/Ticks */
+                    coreview_set_active_level(9);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(9);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x2E) { /* 'C': Jump to Code */
+                    coreview_set_active_level(2);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(2);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x1F) { /* 'S': Jump to Stack */
+                    coreview_set_active_level(5);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(5);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x23) { /* 'H': Jump to Heap */
+                    coreview_set_active_level(4);
+                    coreview_gui_ram_addr = coreview_get_activity_addr(4);
+                    sound_click();
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
+            }
+
             if (sc == 0x3B) { open_window(10); redraw_all_frame(mx, my); continue; } /* F1: App Studio */
             if (sc == 0x3C || (ctrl_down && sc == 0x14)) { open_window(9); redraw_all_frame(mx, my); continue; } /* F2 / Ctrl+T: Terminal */
             if (sc == 0x3D || (ctrl_down && sc == 0x30)) { open_window(12); redraw_all_frame(mx, my); continue; } /* F3 / Ctrl+B: Web Browser */
-            if (sc == 0x3E) { open_window(13); redraw_all_frame(mx, my); continue; } /* F4: AI Assistant */
+            if (sc == 0x3F) {
+                if (focused_win >= 0 && windows[focused_win].app == APP_CODESTUDIO && windows[focused_win].visible && !windows[focused_win].minimized) {
+                    codestudio_run();
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
+                open_window(13);
+                redraw_all_frame(mx, my);
+                continue;
+            } /* F5: Run in App Studio, or Silicon Monitor otherwise */
+            if (ctrl_down && sc == 0x13) { /* Ctrl+R: Run in App Studio */
+                if (focused_win >= 0 && windows[focused_win].app == APP_CODESTUDIO && windows[focused_win].visible && !windows[focused_win].minimized) {
+                    codestudio_run();
+                    redraw_all_frame(mx, my);
+                    continue;
+                }
+            }
 
             /* Snake Keyboard Input */
             if (focused_win >= 0 && windows[focused_win].app == APP_SNAKE && windows[focused_win].visible && !windows[focused_win].minimized) {
@@ -6141,18 +9430,37 @@ void gui_enter(void)
                 continue;
             }
 
-            /* Notepad Full ASCII Input */
+            /* Notepad Full ASCII Input with Scroll Keys */
             if (focused_win >= 0 && windows[focused_win].app == APP_NOTEPAD && windows[focused_win].visible && !windows[focused_win].minimized) {
-                if (sc == 0x0E && notepad_len > 0) { /* Backspace */
+                if (sc == 0x01) { /* Escape: Close Notepad */
+                    windows[focused_win].visible = 0;
+                    windows[focused_win].focused = 0;
+                    focused_win = -1;
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (sc == 0x48) { /* Up Arrow */
+                    if (notepad_scroll > 0) notepad_scroll--;
+                    redraw_all_frame(mx, my);
+                } else if (sc == 0x50) { /* Down Arrow */
+                    notepad_scroll++;
+                    redraw_all_frame(mx, my);
+                } else if (sc == 0x49) { /* Page Up */
+                    notepad_scroll -= 6;
+                    if (notepad_scroll < 0) notepad_scroll = 0;
+                    redraw_all_frame(mx, my);
+                } else if (sc == 0x51) { /* Page Down */
+                    notepad_scroll += 6;
+                    redraw_all_frame(mx, my);
+                } else if (sc == 0x0E && notepad_len > 0) { /* Backspace */
                     notepad_buf[--notepad_len] = '\0';
                     redraw_all_frame(mx, my);
-                } else if (sc == 0x1C && notepad_len < 500) { /* Enter */
+                } else if (sc == 0x1C && notepad_len < NOTEPAD_BUF_MAX - 1) { /* Enter */
                     notepad_buf[notepad_len++] = '\n';
                     notepad_buf[notepad_len] = '\0';
                     redraw_all_frame(mx, my);
                 } else {
                     char ch = scancode_to_ascii(sc, shift_down);
-                    if (ch && notepad_len < 500) {
+                    if (ch && notepad_len < NOTEPAD_BUF_MAX - 1) {
                         notepad_buf[notepad_len++] = ch;
                         notepad_buf[notepad_len] = '\0';
                         redraw_all_frame(mx, my);
@@ -6251,7 +9559,11 @@ void gui_enter(void)
 
             /* App Studio Code Input */
             if (focused_win >= 0 && windows[focused_win].app == APP_CODESTUDIO && windows[focused_win].visible && !windows[focused_win].minimized) {
-                if (ctrl_down && sc == 0x2E) { /* Ctrl+C: Copy */
+                if (sc == 0x3F || (ctrl_down && sc == 0x13)) { /* F5 or Ctrl+R: Run */
+                    codestudio_run();
+                    redraw_all_frame(mx, my);
+                    continue;
+                } else if (ctrl_down && sc == 0x2E) { /* Ctrl+C: Copy */
                     codestudio_copy();
                     redraw_all_frame(mx, my);
                 } else if (ctrl_down && sc == 0x2F) { /* Ctrl+V: Paste */
@@ -6707,26 +10019,7 @@ void gui_enter(void)
                 }
             }
 
-            /* AI Assistant Chat Keyboard Input */
-            if (focused_win >= 0 && windows[focused_win].app == APP_AI_CHAT && windows[focused_win].visible && !windows[focused_win].minimized) {
-                if (sc == 0x0E) { /* Backspace */
-                    if (ai_chat_input_len > 0) {
-                        ai_chat_input[--ai_chat_input_len] = '\0';
-                        redraw_all_frame(mx, my);
-                    }
-                } else if (sc == 0x1C) { /* Enter */
-                    ai_chat_send_message();
-                    redraw_all_frame(mx, my);
-                } else {
-                    char ch = scancode_to_ascii(sc, shift_down);
-                    if (ch && ch >= 32 && ch <= 126 && ai_chat_input_len < 120) {
-                        ai_chat_input[ai_chat_input_len++] = ch;
-                        ai_chat_input[ai_chat_input_len] = '\0';
-                        redraw_all_frame(mx, my);
-                    }
-                }
-                continue;
-            }
+
 
 
 
@@ -6749,12 +10042,26 @@ void gui_enter(void)
         asm volatile("sti; hlt");
     }
 
-    vga_set_text_mode();
-    vga_restore_font_and_text(font_backup);
-    vga_restore_text_palette();
+    if (gui_vesa_active) {
+        gui_vesa_active = 0;
+        if (vesa_term_is_active()) {
+            vesa_set_mode(800, 600, 32);
+            vesa_term_redraw_screen();
+            vesa_flip();
+        } else {
+            vesa_set_text_mode();
+            vga_restore_font_and_text(font_backup);
+            vga_restore_text_palette();
+            vga_clear();
+        }
+    } else {
+        vga_set_text_mode();
+        vga_restore_font_and_text(font_backup);
+        vga_restore_text_palette();
+        vga_clear();
+    }
 
     vga_kbd_flush();
-    vga_clear();
     gui_active = 0;
     /* Return to vga_prompt() which is already on the call stack —
      * do NOT call vga_prompt() here or it creates an infinite recursive loop. */

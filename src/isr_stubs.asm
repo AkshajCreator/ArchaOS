@@ -76,16 +76,109 @@ ISR_ERR   10   ; Invalid TSS           (pushes error code)
 ISR_ERR   11   ; Segment Not Present   (pushes error code)
 ISR_ERR   12   ; Stack Fault           (pushes error code)
 ISR_ERR   13   ; General Protection    (pushes error code)
-ISR_ERR   14   ; Page Fault            (pushes error code)
+; Vector 14: Dedicated Page Fault Stub
+extern page_fault_handler
+global _isr14
+_isr14:
+    cli
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push dword [esp + 52] ; EIP
+    push dword [esp + 52] ; Error code
+    call page_fault_handler
+    add esp, 8
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    add esp, 4            ; discard error code
+    iret
+
 ISR_NOERR 15
 ISR_NOERR 16
 ISR_ERR   17   ; Alignment Check       (pushes error code)
 ISR_NOERR 18
 ISR_NOERR 19
+ISR_NOERR 20   ; Virtualization Exception
+ISR_ERR   21   ; Control Protection Exception (pushes error code)
+ISR_NOERR 22   ; Reserved
+ISR_NOERR 23   ; Reserved
+ISR_NOERR 24   ; Reserved
+ISR_NOERR 25   ; Reserved
+ISR_NOERR 26   ; Reserved
+ISR_NOERR 27   ; Reserved
+ISR_NOERR 28   ; Hypervisor Injection Exception
+ISR_ERR   29   ; VMM Communication Exception  (pushes error code)
+ISR_ERR   30   ; Security Exception           (pushes error code)
+ISR_NOERR 31   ; Reserved
 
+; Vector 128 (0x80): POSIX Syscall Dispatcher
+extern syscall_handler
+global _isr128
+_isr128:
+    cli
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push esp              ; pointer to registers_t
+    call syscall_handler
+    add esp, 4
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iret
 
 ; Dedicated IRQ handlers
-IRQ_STUB 0,  irq0_handler   ; PIT      -> vector 32
+extern scheduler_schedule
+global _irq0
+_irq0:
+    cli
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    call irq0_handler
+    push esp
+    call scheduler_schedule
+    mov esp, eax
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iret
+
 IRQ_STUB 1,  irq1_handler   ; keyboard -> vector 33
 IRQ_STUB 8,  irq8_handler   ; RTC      -> vector 40
 IRQ_STUB 12, irq12_handler  ; mouse    -> vector 44

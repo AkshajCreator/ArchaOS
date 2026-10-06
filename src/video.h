@@ -1,4 +1,3 @@
-// src/video.h — ArchaOS Universal Video Player & Motion Engine
 #ifndef ARCHA_VIDEO_H
 #define ARCHA_VIDEO_H
 

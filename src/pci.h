@@ -1,4 +1,3 @@
-// src/pci.h — PCI bus enumeration
 #ifndef PCI_H
 #define PCI_H
 

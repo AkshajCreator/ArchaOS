@@ -1,4 +1,3 @@
-// src/audio.h — ArchaOS Universal Audio Engine & Synthesizer
 #ifndef AUDIO_H
 #define AUDIO_H
 
@@ -66,5 +65,8 @@ void          audio_get_spectrum(uint8_t *bars, int num_bars);
 void          audio_get_waveform(int8_t *samples, int num_samples);
 
 int           audio_parse_wav(const uint8_t *data, size_t len, wav_header_t *out_hdr, const uint8_t **out_pcm_data);
+
+/* Direct PCM Audio Streaming from Userland */
+int           audio_write_pcm(const void *pcm_data, size_t bytes, int channels, int sample_rate, int bits_per_sample);
 
 #endif

@@ -7,6 +7,7 @@
 void     pit_init(void);
 void     pit_sleep(uint32_t ms);
 uint32_t pit_ticks(void);
+uint32_t *pit_get_ticks_addr(void);
 
 extern volatile uint32_t pit_tick_count;
 

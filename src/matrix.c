@@ -1,4 +1,3 @@
-// src/matrix.c — ArchaOS Animated Matrix Digital Rain Screensaver
 #include "matrix.h"
 #include "vga.h"
 #include "pit.h"

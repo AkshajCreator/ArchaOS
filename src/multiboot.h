@@ -8,7 +8,11 @@
 
 /* Flags telling us which fields are valid */
 #define MULTIBOOT_FLAG_MEM     (1 << 0)   /* mem_lower/mem_upper valid */
+#define MULTIBOOT_FLAG_BOOTDEV (1 << 1)   /* boot_device valid */
+#define MULTIBOOT_FLAG_CMDLINE (1 << 2)   /* cmdline valid */
+#define MULTIBOOT_FLAG_MODS    (1 << 3)   /* mods valid */
 #define MULTIBOOT_FLAG_MMAP    (1 << 6)   /* full memory map valid     */
+#define MULTIBOOT_FLAG_LOADER  (1 << 9)   /* boot_loader_name valid */
 #define MULTIBOOT_FLAG_VBE     (1 << 11)  /* VBE info valid            */
 #define MULTIBOOT_FLAG_FB      (1 << 12)  /* Framebuffer info valid    */
 
@@ -16,10 +20,7 @@
 #define MULTIBOOT_FRAMEBUFFER_TYPE_RGB      1
 #define MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT 2
 
-/* ============================================================
- * MULTIBOOT INFO STRUCT
- * Exactly as GRUB fills it in memory
- * ============================================================ */
+
 
 typedef struct __attribute__((packed))
 {
@@ -52,9 +53,7 @@ typedef struct __attribute__((packed))
     uint8_t  framebuffer_type;  /* 109: 1 = direct RGB */
 } multiboot_info_t;
 
-/* ============================================================
- * MEMORY MAP ENTRY
- * ============================================================ */
+
 
 typedef struct __attribute__((packed))
 {

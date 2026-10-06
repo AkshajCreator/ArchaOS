@@ -1,4 +1,3 @@
-// src/ata.c — ATA/IDE PIO driver implementation
 #include "ata.h"
 #include "serial.h"
 #include "vga.h"

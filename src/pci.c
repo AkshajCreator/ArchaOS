@@ -1,4 +1,3 @@
-// src/pci.c — PCI bus enumeration
 #include "pci.h"
 #include "serial.h"
 #include "vga.h"

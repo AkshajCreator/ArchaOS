@@ -1,4 +1,3 @@
-// src/less.c — ArchaOS Interactive Paginated File Viewer
 #include "less.h"
 #include "fs.h"
 #include "vga.h"

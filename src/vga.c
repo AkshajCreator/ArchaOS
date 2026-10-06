@@ -4,6 +4,11 @@
 #include "kernel.h"
 #include "idt.h"
 #include "theme.h"
+#include "vesa.h"
+#include "font_engine.h"
+#include "pit.h"
+#include "string.h"
+#include "keyboard.h"
 
 #include <stdint.h>
 
@@ -17,9 +22,7 @@ extern void net_poll(void);
 #define CMD_BUFFER_SIZE 128
 #define HISTORY_SIZE    32
 
-/* ============================================================
- * VGA COLORS
- * ============================================================ */
+
 
 #define COLOR_BLACK        0x0
 #define COLOR_GREEN        0x2
@@ -35,12 +38,118 @@ extern void net_poll(void);
 static uint16_t shadow_screen[VGA_WIDTH * VGA_HEIGHT];
 static uint16_t *vga_buffer = (uint16_t *)VGA_ADDRESS;
 
+
+int vesa_term_active = 0;
+
+/* True-color ARGB palette — authentic terminal color aesthetic */
+static const uint32_t cga_to_argb[16] = {
+    0xFF000000, /* 0: Black */
+    0xFF1A4A9A, /* 1: Blue */
+    0xFF00CC44, /* 2: Green */
+    0xFF009DB8, /* 3: Cyan */
+    0xFFAA2222, /* 4: Red */
+    0xFF8833BB, /* 5: Magenta */
+    0xFFFFAA00, /* 6: Brown/Amber */
+    0xFFAAAAAA, /* 7: Light Gray */
+    0xFF555555, /* 8: Dark Gray */
+    0xFF3B9EF8, /* 9: Bright Blue */
+    0xFF00FF66, /* A: Bright Green (prompt) */
+    0xFF00F0FF, /* B: Bright Cyan */
+    0xFFFF5555, /* C: Bright Red */
+    0xFFFF88FF, /* D: Bright Magenta */
+    0xFFFFD700, /* E: Bright Yellow */
+    0xFFF2F2F2  /* F: Bright White */
+};
+
+/* Full-screen layout: 80cols × 24rows × (10w × 24h) = 800×576 + 24px status */
+#define VESA_CHAR_W   10
+#define VESA_CHAR_H   24
+#define VESA_ROWS     24
+#define VESA_STATUS_Y 576
+
+static inline int vga_get_height(void) {
+    return vesa_term_active ? VESA_ROWS : VGA_HEIGHT;
+}
+
+static void vesa_term_draw_cell(int x, int y, uint16_t cell) {
+    if (!vesa_term_active) return;
+    if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VESA_ROWS) return;
+
+    char c = (char)(cell & 0xFF);
+    uint8_t attr = (uint8_t)((cell >> 8) & 0xFF);
+    uint8_t fg_idx = attr & 0x0F;
+    uint8_t bg_idx = (attr >> 4) & 0x0F;
+
+    uint32_t fg_color = cga_to_argb[fg_idx];
+    uint32_t bg_color = (bg_idx == 0) ? 0xFF000000 : cga_to_argb[bg_idx];
+
+    /* Full-screen: cell starts at exactly x*10, y*24 — no offsets */
+    int px = x * VESA_CHAR_W;
+    int py = y * VESA_CHAR_H;
+
+    vesa_fill_rect(px, py, VESA_CHAR_W, VESA_CHAR_H, bg_color);
+    if (c > ' ') {
+        /* 1×2 pixel rendering: 8×8 glyph → 8×16 in a 10×24 cell */
+        const uint8_t *glyph = font_get_glyph(font_get_active(), c);
+        if (glyph) {
+            uint32_t *vbb = vesa_get_backbuffer();
+            if (vbb) {
+                for (int gy = 0; gy < 8; gy++) {
+                    uint8_t row = glyph[gy];
+                    for (int gx = 0; gx < 8; gx++) {
+                        if (row & (0x80 >> gx)) {
+                            int bx = px + 1 + gx;      /* 1× horizontal */
+                            int by = py + 4 + gy * 2;  /* 2× vertical stretch */
+                            if (bx < 800 && by + 1 < VESA_STATUS_Y) {
+                                vbb[by * 800 + bx]       = fg_color;
+                                vbb[(by + 1) * 800 + bx] = fg_color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void vesa_term_draw_status(void) {
+    /* Ultra-subtle status line at y=576..599 — clean high-res indicator */
+    vesa_fill_rect(0, VESA_STATUS_Y, 800, 24, 0xFF060606);
+    vesa_draw_line(0, VESA_STATUS_Y, 800, VESA_STATUS_Y, 0xFF1A2838);
+    vesa_draw_string(10, VESA_STATUS_Y + 8, "[ VESA 800x600 ]  Type 'vesa off' to return to VGA", 0xFF2A4868);
+
+    /* Active font name on right, dynamically right-aligned with safety padding */
+    const char *sname = font_get_name(font_get_active());
+    int slen = 0;
+    while (sname[slen]) slen++;
+    int fx = 800 - 12 - (slen * 8);
+    if (fx < 500) fx = 500;
+    vesa_draw_string(fx, VESA_STATUS_Y + 8, sname, 0xFF3B9EF8);
+}
+
+void vesa_term_redraw_screen(void) {
+    if (!vesa_term_active) return;
+    /* Pure black full-screen — authentic terminal look */
+    vesa_fill_rect(0, 0, 800, 600, 0xFF000000);
+    /* Render 80×24 character grid edge-to-edge */
+    for (int y = 0; y < VESA_ROWS; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            vesa_term_draw_cell(x, y, shadow_screen[y * VGA_WIDTH + x]);
+        }
+    }
+    vesa_term_draw_status();
+}
+
 void vga_write_cell(int x, int y, uint16_t cell)
 {
     if (x < 0 || x >= VGA_WIDTH || y < 0 || y >= VGA_HEIGHT) return;
     int idx = y * VGA_WIDTH + x;
     shadow_screen[idx] = cell;
     vga_buffer[idx] = cell;
+
+    if (vesa_term_active) {
+        vesa_term_draw_cell(x, y, cell);
+    }
 }
 
 uint16_t vga_read_cell(int x, int y)
@@ -62,10 +171,7 @@ static int extended      = 0;
 
 static uint8_t current_attr = ATTR_NORMAL;
 
-/* ============================================================
- * SCROLLBACK BUFFER
- * Stores lines that have scrolled off the top.
- * ============================================================ */
+
 
 #define SCROLLBACK_LINES 200
 
@@ -78,37 +184,11 @@ static char cmd_buffer[CMD_BUFFER_SIZE];
 static int  cmd_len    = 0;
 static int  cmd_cursor = 0;
 
-/* ============================================================
- * HISTORY
- * ============================================================ */
+
 
 static char history[HISTORY_SIZE][CMD_BUFFER_SIZE];
 static int  history_count = 0;
 static int  history_index = 0;
-
-/* ============================================================
- * KEYMAPS
- * ============================================================ */
-
-static const char map_lower[128] =
-{
-    0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b',
-    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,
-    'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\',
-    'z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',
-};
-
-static const char map_upper[128] =
-{
-    0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b',
-    '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,
-    'A','S','D','F','G','H','J','K','L',':','"','~',0,'|',
-    'Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',
-};
-
-/* ============================================================
- * PORT I/O
- * ============================================================ */
 
 static inline uint8_t inb(uint16_t port)
 {
@@ -122,26 +202,66 @@ static inline void outb(uint16_t port, uint8_t val)
     asm volatile("outb %0,%1" : : "a"(val), "Nd"(port));
 }
 
-/* ============================================================
- * STRING
- * ============================================================ */
-
-static int strlen_local(const char *s)
-{
-    int len = 0;
-    while (s[len]) len++;
-    return len;
+static void vesa_term_draw_cursor(void) {
+    if (!vesa_term_active) return;
+    if (cursor_y >= VESA_ROWS) return;
+    int px = cursor_x * VESA_CHAR_W;
+    int py = cursor_y * VESA_CHAR_H;
+    if ((pit_ticks() / 350) % 2 == 0) {
+        /* Slim 2px neon cyan underline cursor */
+        vesa_fill_rect(px, py + 21, VESA_CHAR_W, 2, 0xFF00F0FF);
+    } else {
+        uint16_t cell = shadow_screen[cursor_y * VGA_WIDTH + cursor_x];
+        uint8_t bg_idx = ((cell >> 8) >> 4) & 0x0F;
+        uint32_t bg_color = (bg_idx == 0) ? 0xFF000000 : cga_to_argb[bg_idx];
+        vesa_fill_rect(px, py + 21, VESA_CHAR_W, 2, bg_color);
+    }
 }
 
-/* ============================================================
- * CURSOR
- * ============================================================ */
+
+int vesa_term_is_active(void) {
+    return vesa_term_active;
+}
+
+void vesa_term_enter(void) {
+    if (!vesa_is_available()) {
+        vga_print("VESA linear framebuffer not available.\n");
+        return;
+    }
+    vesa_term_active = 1;
+    vesa_set_mode(800, 600, 32);
+    while (cursor_y >= VESA_ROWS) {
+        vga_scroll();
+        if (prompt_y > 0) prompt_y--;
+    }
+    vesa_term_redraw_screen();
+    vesa_term_draw_cursor();
+    vesa_flip();
+}
+
+void vesa_term_exit(void) {
+    if (!vesa_term_active) return;
+    vesa_term_active = 0;
+    vesa_set_text_mode();
+    vga_restore_text_palette();
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            vga_buffer[y * VGA_WIDTH + x] = shadow_screen[y * VGA_WIDTH + x];
+        }
+    }
+    vga_set_cursor(cursor_x, cursor_y);
+}
 
 static void update_cursor(void)
 {
     uint16_t pos = cursor_y * VGA_WIDTH + cursor_x;
     outb(0x3D4, 0x0F); outb(0x3D5, pos & 0xFF);
     outb(0x3D4, 0x0E); outb(0x3D5, (pos >> 8) & 0xFF);
+
+    if (vesa_term_active) {
+        vesa_term_draw_cursor();
+        vesa_flip();
+    }
 }
 
 void vga_set_cursor(int x, int y)
@@ -151,12 +271,11 @@ void vga_set_cursor(int x, int y)
     update_cursor();
 }
 
-/* ============================================================
- * SCROLL
- * ============================================================ */
+
 
 void vga_scroll(void)
 {
+    int max_h = vga_get_height();
     int y, x;
 
     /* Save top line to scrollback ring buffer */
@@ -167,24 +286,25 @@ void vga_scroll(void)
     if (sb_count < SCROLLBACK_LINES) sb_count++;
 
     /* Scroll screen up */
-    for (y = 1; y < VGA_HEIGHT; y++)
+    for (y = 1; y < max_h; y++)
         for (x = 0; x < VGA_WIDTH; x++)
             vga_write_cell(x, y - 1, shadow_screen[y * VGA_WIDTH + x]);
 
     for (x = 0; x < VGA_WIDTH; x++)
-        vga_write_cell(x, VGA_HEIGHT - 1, ' ' | ((uint16_t)ATTR_NORMAL << 8));
+        vga_write_cell(x, max_h - 1, ' ' | ((uint16_t)ATTR_NORMAL << 8));
 
-    cursor_y = VGA_HEIGHT - 1;
+    cursor_y = max_h - 1;
 }
 
 /* ── Scrollback view ── */
 
 static void sb_render(void)
 {
+    int max_h = vga_get_height();
     /* Render scrollback at current offset onto screen (no cursor move) */
-    for (int y = 0; y < VGA_HEIGHT; y++) {
+    for (int y = 0; y < max_h; y++) {
         /* Which scrollback line maps to screen row y? */
-        int line_idx = sb_head - sb_offset - VGA_HEIGHT + y;
+        int line_idx = sb_head - sb_offset - max_h + y;
         if (line_idx < 0 || line_idx >= sb_head ||
             (sb_head - line_idx) > sb_count) {
             /* Before start of scrollback — blank line */
@@ -221,18 +341,18 @@ int vga_in_scrollback(void) { return sb_offset > 0; }
 
 void vga_ensure_visible(void)
 {
-    while (cursor_y >= VGA_HEIGHT)
+    int max_h = vga_get_height();
+    while (cursor_y >= max_h)
         vga_scroll();
 }
 
-/* ============================================================
- * TEXT
- * ============================================================ */
+
 
 void vga_clear(void)
 {
+    int max_h = vga_get_height();
     int y, x;
-    for (y = 0; y < VGA_HEIGHT; y++)
+    for (y = 0; y < max_h; y++)
         for (x = 0; x < VGA_WIDTH; x++)
             vga_write_cell(x, y, ' ' | ((uint16_t)ATTR_NORMAL << 8));
 
@@ -242,13 +362,7 @@ void vga_clear(void)
     update_cursor();
 }
 
-/* ============================================================
- * ANSI ESCAPE SEQUENCE PARSER (A.4)
- * Supports SGR colors (30-37, 39, 40-47, 49, 90-97, 100-107),
- * bold (1), dim (2,22), inverse (7,27), reset (0),
- * cursor movement (A, B, C, D, H, f, s, u),
- * screen and line clears (J, K), and tab expansion.
- * ============================================================ */
+
 
 #define ANSI_STATE_NORMAL 0
 #define ANSI_STATE_ESC    1
@@ -558,24 +672,19 @@ void vga_print_color(const char *str, uint8_t attr)
 
 void vga_print_center(const char *str)
 {
-    int len = strlen_local(str);
+    int len = strlen(str);
     vga_set_cursor((VGA_WIDTH - len) / 2, VGA_HEIGHT / 2);
     vga_print(str);
 }
 
-/* ============================================================
- * DELAY
- * ============================================================ */
+
 
 static void delay(volatile unsigned int count)
 {
     while (count--) asm volatile("nop");
 }
 
-/* ============================================================
- * BOOT ANIMATION
- * Pixels fill in to form a border, then logo appears
- * ============================================================ */
+
 
 /* Draw one "pixel" (a block char) at vga position */
 static void boot_pixel(int x, int y, char c, uint8_t attr)
@@ -675,7 +784,7 @@ void vga_show_welcome(void)
     /* Version — right-aligned under logo */
     delay(30000000);
     const char *ver = "v0.5  \"Monolith\"";
-    int ver_len = strlen_local(ver);
+    int ver_len = strlen(ver);
     int ver_y   = logo_sy + logo_h + 1;
     int ver_x   = logo_sx + logo_w - ver_len;
 
@@ -690,9 +799,7 @@ void vga_show_welcome(void)
     vga_clear();
 }
 
-/* ============================================================
- * HISTORY
- * ============================================================ */
+
 
 static void history_save(const char *cmd)
 {
@@ -789,15 +896,16 @@ static void redraw_line(void)
     int i;
     int display_len = (suggestion_len > cmd_len) ? suggestion_len : cmd_len;
     int total_rows = (prompt_x + display_len) / VGA_WIDTH + 2;
+    int max_h = vga_get_height();
 
     /* If wrapping would push off bottom, scroll proactively */
-    while (prompt_y + total_rows > VGA_HEIGHT) {
+    while (prompt_y + total_rows > max_h) {
         vga_scroll();
         if (prompt_y > 0) prompt_y--;
     }
 
     /* Clear from prompt position across all wrapped rows */
-    for (int y = prompt_y; y <= prompt_y + total_rows && y < VGA_HEIGHT; y++) {
+    for (int y = prompt_y; y <= prompt_y + total_rows && y < max_h; y++) {
         int start_x = (y == prompt_y) ? prompt_x : 0;
         for (int x = start_x; x < VGA_WIDTH; x++) {
             vga_write_cell(x, y, ' ' | ((uint16_t)ATTR_NORMAL << 8));
@@ -820,7 +928,7 @@ static void redraw_line(void)
             if (cx >= VGA_WIDTH - 1) {
                 cx = 0; cy++;
             } else {
-                if (cy < VGA_HEIGHT) vga_write_cell(cx, cy, ' ' | ((uint16_t)ATTR_NORMAL << 8));
+                if (cy < max_h) vga_write_cell(cx, cy, ' ' | ((uint16_t)ATTR_NORMAL << 8));
                 cx++;
             }
         } else {
@@ -835,7 +943,7 @@ static void redraw_line(void)
                 }
             }
             if (cx >= VGA_WIDTH) { cx = 0; cy++; }
-            if (cy < VGA_HEIGHT) {
+            if (cy < max_h) {
                 vga_write_cell(cx, cy, ((uint16_t)cmd_buffer[i]) | ((uint16_t)ATTR_NORMAL << 8));
             }
             cx++;
@@ -853,7 +961,7 @@ static void redraw_line(void)
             if (suggestion_buf[i] == ' ') {
                 if (cx >= VGA_WIDTH - 1) { cx = 0; cy++; }
                 else {
-                    if (cy < VGA_HEIGHT) vga_write_cell(cx, cy, ' ' | ((uint16_t)0x08 << 8));
+                    if (cy < max_h) vga_write_cell(cx, cy, ' ' | ((uint16_t)0x08 << 8));
                     cx++;
                 }
             } else {
@@ -864,7 +972,7 @@ static void redraw_line(void)
                     }
                 }
                 if (cx >= VGA_WIDTH) { cx = 0; cy++; }
-                if (cy < VGA_HEIGHT) {
+                if (cy < max_h) {
                     vga_write_cell(cx, cy, ((uint16_t)suggestion_buf[i]) | ((uint16_t)0x08 << 8));
                 }
                 cx++;
@@ -875,7 +983,7 @@ static void redraw_line(void)
     cursor_x = target_cx;
     cursor_y = target_cy;
     if (cursor_x >= VGA_WIDTH) cursor_x = VGA_WIDTH - 1;
-    if (cursor_y >= VGA_HEIGHT) cursor_y = VGA_HEIGHT - 1;
+    if (cursor_y >= max_h) cursor_y = max_h - 1;
     update_cursor();
 }
 
@@ -894,26 +1002,27 @@ static void history_load(int index)
     redraw_line();
 }
 
-/* ============================================================
- * KEY TRANSLATION
- * ============================================================ */
+
 
 static char translate_key(uint8_t sc)
 {
-    if (sc >= 128) return 0;
-    char c = shift_pressed ? map_upper[sc] : map_lower[sc];
-    if      (c >= 'a' && c <= 'z' && caps_lock) c -= 32;
-    else if (c >= 'A' && c <= 'Z' && caps_lock) c += 32;
-    return c;
+    return keyboard_scancode_to_ascii(sc, shift_pressed, caps_lock);
 }
 
-/* ============================================================
- * WAIT FOR IRQ KEYPRESS
- * ============================================================ */
+
 
 static uint8_t wait_for_scancode(void)
 {
+    uint32_t last_blink = 0;
     while (!irq_kbd_fired) {
+        if (vesa_term_active) {
+            uint32_t now = pit_ticks();
+            if (now - last_blink >= 250) {
+                last_blink = now;
+                vesa_term_draw_cursor();
+                vesa_flip();
+            }
+        }
         uint8_t st = inb(0x64);
         if ((st & 0x01) && !(st & 0x20)) {
             last_scancode = inb(0x60);
@@ -1032,9 +1141,7 @@ static void vga_tab_complete(void)
     }
 }
 
-/* ============================================================
- * REVERSE INCREMENTAL HISTORY SEARCH (A.2: Ctrl+R)
- * ============================================================ */
+
 
 static int substring_match(const char *haystack, const char *needle)
 {
@@ -1101,7 +1208,7 @@ static void vga_reverse_search(void)
         match_idx = history_count - 1;
     }
 
-    if (prompt_y >= VGA_HEIGHT - 1) {
+    if (prompt_y >= vga_get_height() - 1) {
         vga_scroll();
         if (prompt_y > 0) prompt_y--;
     }
@@ -1270,9 +1377,7 @@ static void vga_reverse_search(void)
     }
 }
 
-/* ============================================================
- * SHELL
- * ============================================================ */
+
 
 void vga_prompt(void)
 {
@@ -1467,9 +1572,7 @@ void vga_prompt(void)
     }
 }
 
-/* ============================================================
- * COMPAT
- * ============================================================ */
+
 
 void vga_print_history(void)
 {

@@ -1,4 +1,3 @@
-// src/serial.c — 16550 UART driver implementation
 #include "serial.h"
 #include <stdint.h>
 #include <stdarg.h>

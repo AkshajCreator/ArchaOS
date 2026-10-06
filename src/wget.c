@@ -1,4 +1,3 @@
-// src/wget.c — ArchaOS Network File Downloader
 #include "wget.h"
 #include "fs.h"
 #include "vga.h"

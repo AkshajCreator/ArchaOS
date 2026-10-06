@@ -7,7 +7,8 @@
 #include "multiboot.h"
 #include "fs.h"
 #include "editor.h"
-#include "ai.h"
+#include "keyboard.h"
+#include "string.h"
 #include "pit.h"
 #include "splash.h"
 #include "neofetch.h"
@@ -25,22 +26,33 @@
 #include "net/dns.h"
 #include "net/tcp.h"
 #include "net/http.h"
-#include "net/nim.h"
 #include "net/browse.h"
 #include "net/js/js_engine.h"
 #include "audio.h"
 #include "video.h"
 #include "matrix.h"
+#include "coreview.h"
 #include "less.h"
 #include "wget.h"
+#include "gamefetch.h"
+#include "iso9660.h"
 #include "shellext.h"
+#include "task.h"
+#include "vmm.h"
+#include "syscall.h"
+#include "elf.h"
+#include "vesa.h"
+#include "font_engine.h"
+#include "mdview.h"
+#include "hexedit.h"
+#include "archmux.h"
+#include "interpreter.h"
+#include "tar.h"
 
 #include <stdint.h>
 #include <stddef.h>
 
-/* ============================================================
- * PORT I/O
- * ============================================================ */
+
 
 static inline uint8_t inb(uint16_t port)
 {
@@ -54,64 +66,9 @@ static inline void outb(uint16_t port, uint8_t val)
     asm volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-/* ============================================================
- * STRINGS
- * ============================================================ */
 
-int atoi(const char *s)
-{
-    int v = 0;
-    while (*s == ' ') s++;
-    int sign = 1;
-    if (*s == '-') { sign = -1; s++; }
-    else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
-    return v * sign;
-}
 
-/* ============================================================
- * ITOA
- * ============================================================ */
 
-char *itoa(int value, char *str, int base)
-{
-    char *rc  = str;
-    char *ptr = str;
-    char *low;
-
-    if (base < 2 || base > 36) { *str = '\0'; return str; }
-
-    unsigned int uval = (unsigned int)value;
-    if (value < 0 && base == 10)
-    {
-        *ptr++ = '-';
-        uval = (unsigned int)(-value);
-    }
-
-    low = ptr;
-
-    do
-    {
-        *ptr++ = "0123456789abcdefghijklmnopqrstuvwxyz"
-        [uval % base];
-        uval /= base;
-    } while (uval);
-
-    *ptr-- = '\0';
-
-    while (low < ptr)
-    {
-        char tmp = *low;
-        *low++   = *ptr;
-        *ptr--   = tmp;
-    }
-
-    return rc;
-}
-
-/* ============================================================
- * REBOOT
- * ============================================================ */
 
 void reboot(void)
 {
@@ -120,10 +77,7 @@ void reboot(void)
     outb(0x64, 0xFE);
 }
 
-/* ============================================================
- * RTC — polled read (used only for uptime baseline at boot)
- * The IRQ8 handler in idt.c re-arms the RTC each tick.
- * ============================================================ */
+
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
@@ -177,33 +131,20 @@ static uint32_t rtc_seconds_since_midnight(void)
     (uint32_t)sec;
 }
 
-/* ============================================================
- * UPTIME
- * ============================================================ */
+
 
 static uint32_t boot_seconds = 0;
 
-/* ============================================================
- * SPEAKER
- * ============================================================ */
+
 
 static void play_sound(uint32_t frequency)
 {
-    if (frequency == 0) return;
-    uint32_t divisor = 1193180 / frequency;
-    uint8_t  tmp;
-
-    outb(0x43, 0xB6);
-    outb(0x42,  divisor & 0xFF);
-    outb(0x42, (divisor >> 8) & 0xFF);
-
-    tmp = inb(0x61);
-    if ((tmp | 3) != tmp) outb(0x61, tmp | 3);
+    audio_play_freq(frequency);
 }
 
 static void no_sound(void)
 {
-    outb(0x61, inb(0x61) & 0xFC);
+    audio_stop();
 }
 
 void beep(void)
@@ -213,25 +154,23 @@ void beep(void)
     no_sound();
 }
 
-/* Boot chime — two rising tones like early PC/Windows */
+/* Boot chime — iconic rising synth chords (C5, E5, G5) */
 void boot_chime(void)
 {
     play_sound(523);  /* C5  */
-    pit_sleep(120);
+    pit_sleep(140);
     no_sound();
-    pit_sleep(40);
+    pit_sleep(30);
     play_sound(659);  /* E5  */
-    pit_sleep(120);
+    pit_sleep(140);
     no_sound();
-    pit_sleep(40);
+    pit_sleep(30);
     play_sound(784);  /* G5  */
-    pit_sleep(180);
+    pit_sleep(220);
     no_sound();
 }
 
-/* ============================================================
- * DATE/TIME COMMAND
- * ============================================================ */
+
 
 static void cmd_datetime(void)
 {
@@ -271,9 +210,7 @@ static void cmd_datetime(void)
     vga_print("\n");
 }
 
-/* ============================================================
- * TREE COMMAND
- * ============================================================ */
+
 
 static void tree_recurse(fs_node_t *dir, char *prefix, int prefix_len, int *d_count, int *f_count, int depth)
 {
@@ -352,14 +289,12 @@ static void cmd_tree(const char *path)
     vga_print(f_count == 1 ? " file\n" : " files\n");
 }
 
-/* ============================================================
- * HEXDUMP / XXD COMMAND
- * ============================================================ */
+
 
 static void cmd_hexdump(const char *path)
 {
     if (!path || !path[0]) {
-        vga_print("usage: hexdump <file> or xxd <file>\n  Displays canonical hex and ASCII dump of a file.\n");
+        vga_print("usage: hexdump <file>\n  Displays canonical hex and ASCII dump of a file.\n");
         return;
     }
     fs_node_t *node = fs_resolve(path);
@@ -416,9 +351,7 @@ static void cmd_hexdump(const char *path)
     }
 }
 
-/* ============================================================
- * STAT COMMAND
- * ============================================================ */
+
 
 static void cmd_stat(const char *path)
 {
@@ -462,9 +395,7 @@ static void cmd_stat(const char *path)
     vga_print("\nAccess: (0755/drwxr-xr-x)  Uid: (0/root)  Gid: (0/root)\n");
 }
 
-/* ============================================================
- * TOP / SYSMON COMMAND
- * ============================================================ */
+
 
 static void cmd_top(void)
 {
@@ -568,27 +499,48 @@ static void cmd_ansi_demo(void)
     vga_print("\033[1;33;41m[Warning Banner]\033[0m\n");
 }
 
-/* ============================================================
- * COMMANDS
- * ============================================================ */
+
+
 
 void kernel_execute_command(const char *cmd)
 {
+    if (game_wizard_handle(cmd)) {
+        return;
+    }
+
     if (strcmp(cmd, "help") == 0)
     {
         vga_print("=== ArchaOS Command Reference ===\n");
         vga_print("System:      help, new, general, clear, reboot, halt, uptime, date, top,\n");
-        vga_print("             neofetch, fortune, theme <name>, matrix, credits, meminfo\n");
+        vga_print("             neofetch, fortune, theme <name>, matrix, coreview, credits, meminfo,\n");
+        vga_print("             ps, kill <pid>, paging, run <elf>, vesa, font, splash\n");
+        vga_print("Userland:    hello, echo, cat, sh (Standalone Ring 3 ELFs in /bin/)\n");
         vga_print("Filesystem:  ls, tree, cd, pwd, mkdir, touch, cat, less, nano, head,\n");
         vga_print("             tail, stat, hexdump, write, rm, cp, mv, wc, grep, find\n");
         vga_print("Multimedia:  audio [play|stop|pause|next|prev|list], video, beep\n");
         vga_print("Networking:  ifconfig, ping <host>, curl <url>, wget <url>, ports\n");
         vga_print("Shell/Env:   export VAR=val, env, unset VAR, $VAR, cmd1; cmd2, pipes |\n");
         vga_print("             Ctrl+R (history search), ansi / colors (palette test)\n");
-        vga_print("GUI Desktop: gui (Mode 13h desktop with Web Browser & In-Browser Media)\n");
+        vga_print("Developer:   devguide (View C app developer guide & API reference)\n");
+        vga_print("GUI Desktop: gui [vga|<file>] (VESA 800x600 true-color desktop or Mode 13h)\n");
         vga_print("Hardware:    pci [list|scan], serial [com1|com2] [write|read|status]\n");
     }
+    else if (strcmp(cmd, "devguide") == 0)
+    {
+        if (!gui_active && !shellext_is_capturing()) {
+            cmd_less("/docs/dev.txt");
+        } else {
+            fs_node_t *f = fs_resolve("/docs/dev.txt");
+            if (f && f->data) {
+                vga_print((const char *)f->data);
+                vga_print("\n");
+            } else {
+                vga_print("File /docs/dev.txt not found.\n");
+            }
+        }
+    }
     else if (strcmp(cmd, "new") == 0)
+
     {
         if (!gui_active && !shellext_is_capturing()) {
             cmd_less("/new");
@@ -723,6 +675,10 @@ void kernel_execute_command(const char *cmd)
     {
         cmd_matrix();
     }
+    else if (strcmp(cmd, "coreview") == 0)
+    {
+        coreview_run_cli();
+    }
     else if (strncmp(cmd, "theme ", 6) == 0)
     {
         theme_set(cmd + 6);
@@ -822,6 +778,27 @@ void kernel_execute_command(const char *cmd)
                           (strncmp(cmd, "more ", 5) == 0) ? cmd + 5 : 0;
         cmd_less(arg);
     }
+    else if (strcmp(cmd, "mdview") == 0 || strncmp(cmd, "mdview ", 7) == 0)
+    {
+        const char *arg = (strncmp(cmd, "mdview ", 7) == 0) ? cmd + 7 : "";
+        cmd_mdview(arg);
+    }
+    else if (strcmp(cmd, "hexedit") == 0 || strncmp(cmd, "hexedit ", 8) == 0)
+    {
+        const char *arg = (strncmp(cmd, "hexedit ", 8) == 0) ? cmd + 8 : "";
+        cmd_hexedit(arg);
+    }
+    else if (strcmp(cmd, "archmux") == 0)
+    {
+        cmd_archmux();
+    }
+    else if (strcmp(cmd, "python") == 0 || strncmp(cmd, "python ", 7) == 0 ||
+             strcmp(cmd, "py") == 0 || strncmp(cmd, "py ", 3) == 0)
+    {
+        const char *arg = (strncmp(cmd, "python ", 7) == 0) ? cmd + 7 :
+                          (strncmp(cmd, "py ", 3) == 0) ? cmd + 3 : "";
+        cmd_python(arg);
+    }
 
     else if (strcmp(cmd, "head") == 0 || strncmp(cmd, "head ", 5) == 0)
     {
@@ -903,11 +880,9 @@ void kernel_execute_command(const char *cmd)
         const char *arg = (strncmp(cmd, "stat ", 5) == 0) ? cmd + 5 : 0;
         cmd_stat(arg);
     }
-    else if (strcmp(cmd, "hexdump") == 0 || strncmp(cmd, "hexdump ", 8) == 0 ||
-             strcmp(cmd, "xxd") == 0 || strncmp(cmd, "xxd ", 4) == 0)
+    else if (strcmp(cmd, "hexdump") == 0 || strncmp(cmd, "hexdump ", 8) == 0)
     {
-        const char *arg = (strncmp(cmd, "hexdump ", 8) == 0) ? cmd + 8 :
-                          (strncmp(cmd, "xxd ", 4) == 0) ? cmd + 4 : 0;
+        const char *arg = (strncmp(cmd, "hexdump ", 8) == 0) ? cmd + 8 : 0;
         cmd_hexdump(arg);
     }
 
@@ -1433,58 +1408,6 @@ void kernel_execute_command(const char *cmd)
         else
             editor_open(arg);
     }
-    else if (strcmp(cmd, "ai") == 0 || strncmp(cmd, "ai ", 3) == 0 ||
-             strncmp(cmd, "deepseek ", 9) == 0 || strncmp(cmd, "ask ", 4) == 0)
-    {
-        const char *prompt = 0;
-        if (strncmp(cmd, "deepseek ", 9) == 0) prompt = cmd + 9;
-        else if (strncmp(cmd, "ask ", 4) == 0) prompt = cmd + 4;
-        else if (strncmp(cmd, "ai ", 3) == 0)  prompt = cmd + 3;
-
-        if (prompt) {
-            if (strcmp(prompt, "clear") == 0 || strcmp(prompt, "reset") == 0) {
-                nim_history_clear();
-                vga_print("[AI] Conversation memory cleared.\n");
-            } else if (strcmp(prompt, "history") == 0) {
-                int cnt = nim_history_count();
-                if (cnt == 0) {
-                    vga_print("[AI] No conversation history recorded.\n");
-                } else {
-                    vga_print("=== AI Conversation History ===\n");
-                    for (int h = 0; h < cnt; h++) {
-                        const nim_message_t *m = nim_history_get(h);
-                        vga_print("["); vga_print(m->role); vga_print("] ");
-                        vga_print(m->content);
-                        vga_print("\n");
-                    }
-                }
-            } else {
-                int online_ok = 0;
-                if (net_if.up) {
-                    vga_print("[AI] Thinking...\n");
-                    static char ai_resp[4096];
-                    if (nim_query(prompt, ai_resp, sizeof(ai_resp)) && ai_resp[0]) {
-                        vga_print(ai_resp);
-                        vga_print("\n");
-                        online_ok = 1;
-                    }
-                }
-                if (!online_ok) {
-                    char resp[128];
-                    ai_get_response(prompt, resp, sizeof(resp));
-                    vga_print("AI > ");
-                    vga_print(resp);
-                    vga_print("\n");
-                    nim_history_add("user", prompt);
-                    nim_history_add("assistant", resp);
-                }
-            }
-        } else if (gui_active) {
-            vga_print("AI > ArchaOS Assistant ready. Type 'ai <question>' (e.g. 'ai hello').\n");
-        } else {
-            ai_chat();
-        }
-    }
     else if (strcmp(cmd, "audio") == 0 || strncmp(cmd, "audio ", 6) == 0 ||
              strcmp(cmd, "play") == 0 || strncmp(cmd, "play ", 5) == 0)
     {
@@ -1556,14 +1479,23 @@ void kernel_execute_command(const char *cmd)
             }
         }
     }
-    else if (strcmp(cmd, "gui") == 0)
+    else if (strncmp(cmd, "gui", 3) == 0)
     {
-        gui_enter();
+        if (strcmp(cmd, "gui vga") == 0) {
+            gui_set_force_vga(1);
+            gui_enter();
+            gui_set_force_vga(0);
+        } else if (strlen(cmd) > 3 && cmd[3] == ' ') {
+            const char *arg = cmd + 4;
+            while (*arg == ' ') arg++;
+            gui_set_pending_file(arg);
+            gui_enter();
+        } else {
+            gui_enter();
+        }
     }
 
-    /* ============================================================
-     * NETWORK COMMANDS
-     * ============================================================ */
+    
     else if (strcmp(cmd, "ifconfig") == 0 || strcmp(cmd, "ipconfig") == 0)
     {
         if (!e1000_is_active()) {
@@ -1677,6 +1609,21 @@ void kernel_execute_command(const char *cmd)
         const char *arg = (strncmp(cmd, "wget ", 5) == 0) ? cmd + 5 : 0;
         cmd_wget(arg);
     }
+    else if (strcmp(cmd, "game-fetch") == 0 || strncmp(cmd, "game-fetch ", 11) == 0)
+    {
+        const char *arg = (strncmp(cmd, "game-fetch ", 11) == 0) ? cmd + 11 : 0;
+        cmd_game_fetch(arg);
+    }
+    else if (strcmp(cmd, "tar") == 0 || strncmp(cmd, "tar ", 4) == 0)
+    {
+        const char *arg = (strncmp(cmd, "tar ", 4) == 0) ? cmd + 4 : 0;
+        cmd_tar(arg);
+    }
+    else if (strcmp(cmd, "mount") == 0 || strncmp(cmd, "mount ", 6) == 0)
+    {
+        const char *arg = (strncmp(cmd, "mount ", 6) == 0) ? cmd + 6 : 0;
+        cmd_mount(arg);
+    }
     else if (strcmp(cmd, "netstat") == 0)
     {
         if (!e1000_is_active()) { vga_print("No network adapter.\n"); }
@@ -1707,29 +1654,245 @@ void kernel_execute_command(const char *cmd)
             }
         }
     }
+    else if (strcmp(cmd, "ps") == 0 || strcmp(cmd, "tasks") == 0)
+    {
+        vga_print("  PID  NAME             STATE      PRIO  TICKS\n");
+        vga_print("  -----------------------------------------------\n");
+        for (int i = 0; i < MAX_TASKS; i++) {
+            task_t *t = task_get_by_index(i);
+            if (!t || t->state == TASK_UNUSED || t->state == TASK_TERMINATED) continue;
+            char buf[16];
+            vga_print("  ");
+            itoa((int)t->pid, buf, 10);
+            vga_print(buf);
+            for (int s = strlen(buf); s < 5; s++) vga_print(" ");
+            vga_print(t->name);
+            for (int s = strlen(t->name); s < 17; s++) vga_print(" ");
+            const char *st_str = (t->state == TASK_RUNNING) ? "RUNNING  " :
+                                 (t->state == TASK_READY)   ? "READY    " :
+                                 (t->state == TASK_SLEEPING)? "SLEEPING " :
+                                 (t->state == TASK_BLOCKED) ? "BLOCKED  " : "UNKNOWN  ";
+            vga_print(st_str);
+            itoa((int)t->priority, buf, 10);
+            vga_print(" "); vga_print(buf); vga_print("     ");
+            itoa((int)t->total_ticks, buf, 10);
+            vga_print(buf); vga_print("\n");
+        }
+    }
+    else if (strncmp(cmd, "kill ", 5) == 0)
+    {
+        int pid = atoi(cmd + 5);
+        if (pid <= 0) {
+            vga_print("kill: invalid PID (cannot kill kernel_main)\n");
+        } else {
+            task_kill((uint32_t)pid);
+            vga_print("Killed task PID ");
+            char buf[16]; itoa(pid, buf, 10);
+            vga_print(buf); vga_print("\n");
+        }
+    }
+    else if (strncmp(cmd, "vesa", 4) == 0)
+    {
+        const char *arg = cmd + 4;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0' || strcmp(arg, "info") == 0) {
+            vesa_driver_t *drv = vesa_get_driver();
+            vga_print("VESA VBE / BGA Framebuffer Status:\n");
+            vga_print("  Active Mode:  ");
+            if (vesa_is_active()) {
+                char b[16]; itoa(drv->width, b, 10); vga_print(b); vga_print("x");
+                itoa(drv->height, b, 10); vga_print(b); vga_print("x");
+                itoa(drv->bpp, b, 10); vga_print(b); vga_print(" 32-bit ARGB True Color\n");
+            } else {
+                vga_print("Inactive (VGA 80x25 Text Mode / Mode 13h)\n");
+            }
+            vga_print("  BGA Adapter:  ");
+            if (drv->bga_detected) {
+                vga_print("Detected (Version 0x");
+                char b[16]; itoa(drv->bga_version, b, 16); vga_print(b); vga_print(")\n");
+            } else {
+                vga_print("Not Detected\n");
+            }
+            vga_print("  VRAM Base:    0x");
+            char b[16]; itoa(drv->phys_base, b, 16); vga_print(b); vga_print("\n");
+            vga_print("  Supported:    800x600x32 True Color\n");
+            vga_print("Usage: vesa <on | off | info>\n");
+        } else if (strcmp(arg, "term") == 0 || strcmp(arg, "on") == 0) {
+            vesa_term_enter();
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "text") == 0) {
+            vesa_term_exit();
+            vga_clear();
+            vga_print("Restored VGA 80x25 Text Mode.\n");
+        } else {
+            vga_print("Unknown vesa argument. Type 'vesa info'.\n");
+        }
+    }
+    else if (strcmp(cmd, "mode text") == 0)
+    {
+        vesa_term_exit();
+        vga_clear();
+        vga_print("Switched to VGA 80x25 Text Mode.\n");
+    }
+    else if (strcmp(cmd, "mode vesa") == 0)
+    {
+        vesa_term_enter();
+    }
+    else if (strncmp(cmd, "font", 4) == 0)
+    {
+        const char *arg = cmd + 4;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0' || strcmp(arg, "list") == 0) {
+            vga_print("ArchaOS Custom Bitmap Typography Engine:\n");
+            int active = font_get_active();
+            for (int i = 0; i < font_get_count(); i++) {
+                vga_print(i == active ? "  -> [" : "     [");
+                char b[4]; b[0] = '0' + i; b[1] = '\0';
+                vga_print(b); vga_print("] ");
+                vga_print(font_get_name(i));
+                vga_print(i == active ? " (Active)\n" : "\n");
+            }
+            vga_print("\nUsage:\n  font set <0-3>\n  font preview\n");
+        } else if (strncmp(arg, "set ", 4) == 0) {
+            const char *val = arg + 4;
+            while (*val == ' ') val++;
+            int fid = atoi(val);
+            if (fid >= 0 && fid < font_get_count()) {
+                font_set_active(fid);
+                vga_print("Active typography set to: ");
+                vga_print(font_get_name(fid));
+                vga_print("\n");
+                if (vesa_term_is_active()) {
+                    vesa_term_redraw_screen();
+                    vesa_flip();
+                }
+            } else {
+                vga_print("Invalid font ID. Choose 0 to 3.\n");
+            }
+        } else if (strcmp(arg, "preview") == 0) {
+            font_print_preview_card(vga_print);
+        } else {
+            vga_print("Usage: font [list | set <0-3> | preview]\n");
+        }
+    }
+    else if (strcmp(cmd, "splash") == 0)
+    {
+        splash_show();
+    }
+    else if (strcmp(cmd, "paging") == 0)
+    {
+        vga_print("Two-Tier x86 Paging MMU Status:\n");
+        vga_print("  CR0.PG: Enabled (Paging Active, WP=1)\n");
+        vga_print("  CR3: 0x");
+        uint32_t cr3; asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        char buf[32]; itoa(cr3, buf, 16); vga_print(buf); vga_print("\n");
+        vga_print("  Free Physical Frames: ");
+        itoa(pmm_free_frames_count(), buf, 10); vga_print(buf);
+        vga_print(" / ");
+        itoa(pmm_total_frames_count(), buf, 10); vga_print(buf);
+        vga_print(" (4KB frames)\n");
+    }
+    else if (strncmp(cmd, "run ", 4) == 0)
+    {
+        const char *p = cmd + 4;
+        while (*p == ' ') p++;
+        if (*p == '\0') {
+            vga_print("Usage: run <path_to_elf> [args...]\n");
+        } else {
+            char raw_path[64];
+            int pi = 0;
+            while (*p && *p != ' ' && pi < 63) {
+                raw_path[pi++] = *p++;
+            }
+            raw_path[pi] = '\0';
 
+            char elf_path[64];
+            resolve_elf_path(raw_path, elf_path, sizeof(elf_path));
+
+            int pid = elf_load_file_args(elf_path, cmd + 4);
+            if (pid > 0) {
+                while (task_is_running(pid)) {
+                    if (keyboard_has_char()) {
+                        char ch = keyboard_getchar();
+                        if (ch == 3 || ch == 27) {
+                            vga_print("^C\n");
+                            task_kill((uint32_t)pid);
+                            break;
+                        }
+                    }
+                    task_sleep(10);
+                }
+            } else {
+                vga_print("Error: Failed to load ELF executable '"); vga_print(elf_path); vga_print("'\n");
+            }
+        }
+    }
     else
     {
-        vga_print("Unknown command. Type 'help'.\n");
+        /* Check if command matches an executable ELF binary in /bin or direct path */
+        char prog_name[64];
+        int pi = 0;
+        while (cmd[pi] && cmd[pi] != ' ' && pi < 63) {
+            prog_name[pi] = cmd[pi];
+            pi++;
+        }
+        prog_name[pi] = '\0';
+
+        char elf_path[64];
+        resolve_elf_path(prog_name, elf_path, sizeof(elf_path));
+
+        int pid = -1;
+        if (fs_resolve(elf_path)) {
+            pid = elf_load_file_args(elf_path, cmd);
+        }
+
+        if (pid > 0) {
+            /* Synchronously wait for foreground user process to finish with Ctrl+C interrupt support */
+            while (task_is_running(pid)) {
+                if (keyboard_has_char()) {
+                    char ch = keyboard_getchar();
+                    if (ch == 3 || ch == 27) {
+                        vga_print("^C\n");
+                        task_kill((uint32_t)pid);
+                        break;
+                    }
+                }
+                task_sleep(10);
+            }
+        } else {
+            vga_print("Unknown command. Type 'help'.\n");
+        }
     }
+
 }
 
-/* ============================================================
- * KERNEL MAIN
- * ============================================================ */
+
 
 void kernel_main(uint32_t mb_magic, void *mb_info)
 {
     /* Step 0: Clear screen */
     vga_clear();
 
-    /* Step 1: Detect RAM from multiboot map, init memory manager */
+    /* Step 1: Detect RAM from multiboot map */
     uint32_t detected_ram = 0;
+    uint32_t mmap_addr = 0;
+    uint32_t mmap_len = 0;
+
+    const char *bootloader_name = "Generic Multiboot";
+    static char boot_cmdline[128] = {0};
 
     if (mb_magic == MULTIBOOT_MAGIC && mb_info)
     {
         multiboot_info_t *mbi = (multiboot_info_t *)mb_info;
+        if ((mbi->flags & MULTIBOOT_FLAG_LOADER) && mbi->boot_loader_name != 0) {
+            bootloader_name = (const char *)mbi->boot_loader_name;
+        }
+        if ((mbi->flags & MULTIBOOT_FLAG_CMDLINE) && mbi->cmdline != 0) {
+            const char *src = (const char *)mbi->cmdline;
+            strncpy(boot_cmdline, src, sizeof(boot_cmdline) - 1);
+        }
         if (mbi->flags & MULTIBOOT_FLAG_MMAP) {
+            mmap_addr = mbi->mmap_addr;
+            mmap_len = mbi->mmap_length;
             uint32_t offset = 0;
             uint64_t total_usable = 0;
             while (offset < mbi->mmap_length && offset < 8192) {
@@ -1752,30 +1915,78 @@ void kernel_main(uint32_t mb_magic, void *mb_info)
         detected_ram = 32 * 1024 * 1024;
     }
 
-    mm_init(detected_ram);
-    fs_init();
-    ai_init();
-
-    /* Step 1.5: Initialize serial ports for debugging (COM1 @ 115200, COM2 @ 115200) */
+    /* 1) serial_init */
     serial_init(COM1_BASE, 115200);
-    serial_puts(COM1_BASE, "\n=== ArchaOS v0.5 \"Monolith\" Serial Debug ===\n");
+    serial_puts(COM1_BASE, "\n=== ArchaOS v0.6 \"Nexus\" Serial Debug ===\n");
+    serial_printf(COM1_BASE, "Bootloader: %s\n", bootloader_name);
+    if (boot_cmdline[0]) {
+        serial_printf(COM1_BASE, "Kernel Cmdline: %s\n", boot_cmdline);
+    }
     serial_printf(COM1_BASE, "Detected RAM: %u KB\n", detected_ram / 1024);
     serial_puts(COM1_BASE, "VGA Text Mode: 80x25 at 0xB8000\n");
 
     serial_init(COM2_BASE, 115200);
     serial_puts(COM2_BASE, "\n=== ArchaOS v0.5 \"Monolith\" COM2 Ready ===\n");
 
-    /* Step 2: IDT + PIC remap + IRQ enable */
+    /* 2) idt_init */
     idt_init();
     serial_puts(COM1_BASE, "IDT initialized\n");
+
+    /* 3) vmm_init(mmap_addr, mmap_len, detected_ram) */
+    vmm_init(mmap_addr, mmap_len, detected_ram);
+
+    /* 4) mm_init(detected_ram) */
+    mm_init(detected_ram);
+
+    /* 5) fs_init() */
+    fs_init();
+
+    /* Multiboot Initrd Module Auto-Extraction (TarFS) */
+    if (mb_magic == MULTIBOOT_MAGIC && mb_info) {
+        multiboot_info_t *mbi = (multiboot_info_t *)mb_info;
+        if (mbi->mods_count > 0 && mbi->mods_addr != 0) {
+            typedef struct {
+                uint32_t mod_start;
+                uint32_t mod_end;
+                uint32_t string;
+                uint32_t reserved;
+            } mb_module_entry_t;
+
+            mb_module_entry_t *mods = (mb_module_entry_t *)mbi->mods_addr;
+            for (uint32_t m = 0; m < mbi->mods_count; m++) {
+                uint8_t *mod_data = (uint8_t *)mods[m].mod_start;
+                size_t mod_len = mods[m].mod_end - mods[m].mod_start;
+                if (mod_data && mod_len > 0) {
+                    serial_printf(COM1_BASE, "[Initrd] Extracting Multiboot Module #%u (%u bytes) into VFS...\n", m, mod_len);
+                    tar_extract(mod_data, mod_len, "/");
+                }
+            }
+        }
+    }
+
+    /* 6) keyboard_init() */
+    keyboard_init();
+
+    /* 7) syscall_init() */
+    syscall_init();
+    elf_init_samples();
 
     /* Step 3: PIT timer (~1000 Hz) */
     pit_init();
     serial_puts(COM1_BASE, "PIT initialized\n");
 
+    /* Step 3.1: Preemptive Multitasking & Scheduler */
+    task_init();
+    serial_puts(COM1_BASE, "Preemptive Multitasking & Scheduler initialized\n");
+
     /* Step 3.5: PCI enumeration */
     pci_scan();
     serial_puts(COM1_BASE, "PCI enumerated\n");
+
+    /* Step 3.55: High-Res VESA / BGA Framebuffer & Typography Engine */
+    vesa_init((multiboot_info_t *)mb_info);
+    font_engine_init();
+    serial_puts(COM1_BASE, "VESA VBE & Typography Engine initialized\n");
 
     /* Step 3.6: ATA/IDE initialization */
     ata_init();
@@ -1791,7 +2002,6 @@ void kernel_main(uint32_t mb_magic, void *mb_info)
         net_init();
         serial_puts(COM1_BASE, "Requesting IP via DHCP...\n");
         dhcp_request();
-        nim_init();
         char ip_str[16];
         ip_to_str(net_if.ip, ip_str);
         serial_printf(COM1_BASE, "Network ready: %s\n", ip_str);
@@ -1808,9 +2018,17 @@ void kernel_main(uint32_t mb_magic, void *mb_info)
 
     /* Step 6: PS/2 mouse — removed (Wayland incompatibility) */
 
-    /* Step 7: Shell */
-    serial_puts(COM1_BASE, "Entering shell...\n");
-    vga_prompt();
+    /* Step 7: Shell or GUI according to bootloader parameters */
+    serial_puts(COM1_BASE, "[KERNEL] Monolithic Higher-Half Kernel ready. Ring 3 userland in /bin/\n");
+    if (strstr(boot_cmdline, "gui") != NULL) {
+        serial_puts(COM1_BASE, "Autostarting GUI Desktop from boot command line...\n");
+        gui_enter();
+        serial_puts(COM1_BASE, "Exited GUI Desktop. Entering shell...\n");
+        vga_prompt();
+    } else {
+        serial_puts(COM1_BASE, "Entering shell...\n");
+        vga_prompt();
+    }
 
     /* Should never reach here */
     for (;;) asm volatile("hlt");

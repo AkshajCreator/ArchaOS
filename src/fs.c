@@ -4,53 +4,17 @@
 
 #include "fs.h"
 #include "mm.h"
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 
-/* ============================================================
- * INTERNAL HELPERS
- * ============================================================ */
 
-static int fs_strlen(const char *s)
-{
-    int n = 0; while (s[n]) n++; return n;
-}
-
-static void fs_strcpy(char *dst, const char *src)
-{
-    while ((*dst++ = *src++));
-}
-
-static void fs_strncpy(char *dst, const char *src, int n)
-{
-    int i = 0;
-    while (i < n - 1 && src[i]) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
-
-static int fs_strcmp(const char *a, const char *b)
-{
-    while (*a && (*a == *b)) { a++; b++; }
-    return *(const unsigned char *)a - *(const unsigned char *)b;
-}
-
-static void fs_memcpy(void *dst, const void *src, size_t n)
-{
-    uint8_t *d = dst; const uint8_t *s = src;
-    while (n--) *d++ = *s++;
-}
-
-static void fs_memset(void *dst, uint8_t val, size_t n)
-{
-    uint8_t *d = dst;
-    while (n--) *d++ = val;
-}
 
 /* Append src to dst, dst has bufsz total capacity */
 static void fs_strcat(char *dst, const char *src, size_t bufsz)
 {
     if (!dst || !src || bufsz == 0) return;
-    int dlen = fs_strlen(dst);
+    int dlen = strlen(dst);
     if ((size_t)dlen >= bufsz) { dst[bufsz - 1] = '\0'; return; }
     int i = 0;
     while (src[i] && (size_t)(dlen + i + 1) < bufsz)
@@ -61,9 +25,7 @@ static void fs_strcat(char *dst, const char *src, size_t bufsz)
     dst[dlen + i] = '\0';
 }
 
-/* ============================================================
- * NODE POOL — 64 static nodes, allocated with a used[] flag
- * ============================================================ */
+
 
 static fs_node_t node_pool[FS_MAX_NODES];
 static uint8_t   node_used[FS_MAX_NODES];
@@ -76,7 +38,7 @@ static fs_node_t *node_alloc(void)
         if (!node_used[i])
         {
             node_used[i] = 1;
-            fs_memset(&node_pool[i], 0, sizeof(fs_node_t));
+            memset(&node_pool[i], 0, sizeof(fs_node_t));
             node_count++;
             return &node_pool[i];
         }
@@ -86,6 +48,11 @@ static fs_node_t *node_alloc(void)
 
 static void node_free(fs_node_t *n)
 {
+    if (!n) return;
+    if (n->data && !n->is_const) {
+        kfree(n->data);
+        n->data = 0;
+    }
     for (int i = 0; i < FS_MAX_NODES; i++)
     {
         if (&node_pool[i] == n)
@@ -97,27 +64,23 @@ static void node_free(fs_node_t *n)
     }
 }
 
-/* ============================================================
- * STATE
- * ============================================================ */
+
 
 static fs_node_t *root_node = 0;
 static fs_node_t *cwd_node  = 0;
 
-/* ============================================================
- * FS_INIT
- * ============================================================ */
+
 
 static void fs_init_default_files(void);
 
 void fs_init(void)
 {
-    fs_memset(node_pool, 0, sizeof(node_pool));
-    fs_memset(node_used, 0, sizeof(node_used));
+    memset(node_pool, 0, sizeof(node_pool));
+    memset(node_used, 0, sizeof(node_used));
     node_count = 0;
 
     root_node = node_alloc();
-    fs_strcpy(root_node->name, "/");
+    strcpy(root_node->name, "/");
     root_node->type   = FS_DIR;
     root_node->parent = root_node;  /* root's parent is itself */
 
@@ -126,9 +89,7 @@ void fs_init(void)
     fs_init_default_files();
 }
 
-/* ============================================================
- * NAVIGATION
- * ============================================================ */
+
 
 fs_node_t *fs_root(void) { return root_node; }
 fs_node_t *fs_cwd(void)  { return cwd_node;  }
@@ -139,7 +100,7 @@ void fs_pwd(char *buf, size_t bufsz)
     /* Build path by walking up to root */
     fs_node_t *cur = cwd_node;
 
-    if (!cur || cur == root_node) { fs_strncpy(buf, "/", bufsz); return; }
+    if (!cur || cur == root_node) { strncpy(buf, "/", bufsz); return; }
 
     /* Collect path segments */
     char segments[16][FS_MAX_NAME];
@@ -147,7 +108,7 @@ void fs_pwd(char *buf, size_t bufsz)
 
     while (cur != root_node && depth < 16)
     {
-        fs_strcpy(segments[depth++], cur->name);
+        strcpy(segments[depth++], cur->name);
         cur = cur->parent;
     }
 
@@ -159,17 +120,17 @@ void fs_pwd(char *buf, size_t bufsz)
     }
 }
 
-/* ============================================================
- * PATH RESOLUTION
- * Split a path into components and walk the tree
- * ============================================================ */
 
-/* Find a child by name in a directory node */
+
+/* Find a child by name in a directory node (exact match, then case-insensitive fallback) */
 static fs_node_t *find_child(fs_node_t *dir, const char *name)
 {
     if (!dir || dir->type != FS_DIR) return 0;
     for (int i = 0; i < dir->child_count; i++)
-        if (fs_strcmp(dir->children[i]->name, name) == 0)
+        if (strcmp(dir->children[i]->name, name) == 0)
+            return dir->children[i];
+    for (int i = 0; i < dir->child_count; i++)
+        if (strcasecmp(dir->children[i]->name, name) == 0)
             return dir->children[i];
     return 0;
 }
@@ -209,12 +170,15 @@ fs_node_t *fs_resolve(const char *path)
 
     /* Copy path so we can tokenize it */
     char tmp[FS_MAX_PATH];
-    fs_strncpy(tmp, path, FS_MAX_PATH);
+    strncpy(tmp, path, FS_MAX_PATH);
 
     int i = (path[0] == '/') ? 1 : 0;
 
     while (tmp[i])
     {
+        while (tmp[i] == '/') i++;
+        if (!tmp[i]) break;
+
         /* Extract next component */
         char comp[FS_MAX_NAME];
         int  j = 0;
@@ -224,10 +188,10 @@ fs_node_t *fs_resolve(const char *path)
         comp[j] = '\0';
         if (tmp[i] == '/') i++;
 
-        if (!comp[0] || fs_strcmp(comp, ".") == 0)
+        if (!comp[0] || strcmp(comp, ".") == 0)
             continue;
 
-        if (fs_strcmp(comp, "..") == 0)
+        if (strcmp(comp, "..") == 0)
         {
             cur = cur->parent;
             continue;
@@ -245,9 +209,9 @@ static fs_node_t *resolve_parent(const char *path, char *name_out)
 {
     if (!path || !name_out) return 0;
     char tmp[FS_MAX_PATH];
-    fs_strncpy(tmp, path, FS_MAX_PATH);
+    strncpy(tmp, path, FS_MAX_PATH);
 
-    int len = fs_strlen(tmp);
+    int len = strlen(tmp);
 
     /* Remove trailing slash */
     if (len > 1 && tmp[len-1] == '/') { tmp[--len] = '\0'; }
@@ -262,11 +226,11 @@ static fs_node_t *resolve_parent(const char *path, char *name_out)
     if (slash < 0)
     {
         /* No slash — parent is cwd */
-        fs_strncpy(name_out, tmp, FS_MAX_NAME);
+        strncpy(name_out, tmp, FS_MAX_NAME);
         return cwd_node;
     }
 
-    fs_strncpy(name_out, tmp + slash + 1, FS_MAX_NAME);
+    strncpy(name_out, tmp + slash + 1, FS_MAX_NAME);
 
     if (slash == 0)
         return root_node;
@@ -275,9 +239,7 @@ static fs_node_t *resolve_parent(const char *path, char *name_out)
     return fs_resolve(tmp);
 }
 
-/* ============================================================
- * FS_CD
- * ============================================================ */
+
 
 int fs_cd(const char *path)
 {
@@ -287,9 +249,56 @@ int fs_cd(const char *path)
     return 0;
 }
 
-/* ============================================================
- * FS_MKDIR
- * ============================================================ */
+
+
+int fs_mkdir_p(const char *path)
+{
+    if (!path || !path[0]) return 0;
+    char tmp[FS_MAX_PATH];
+    strncpy(tmp, path, FS_MAX_PATH);
+    int len = strlen(tmp);
+    if (len > 1 && tmp[len-1] == '/') tmp[--len] = '\0';
+
+    fs_node_t *cur = (tmp[0] == '/') ? root_node : cwd_node;
+    int i = (tmp[0] == '/') ? 1 : 0;
+
+    while (tmp[i])
+    {
+        while (tmp[i] == '/') i++;
+        if (!tmp[i]) break;
+
+        char comp[FS_MAX_NAME];
+        int j = 0;
+        while (tmp[i] && tmp[i] != '/' && j < FS_MAX_NAME - 1)
+            comp[j++] = tmp[i++];
+        while (tmp[i] && tmp[i] != '/') i++;
+        comp[j] = '\0';
+        if (tmp[i] == '/') i++;
+
+        if (!comp[0] || strcmp(comp, ".") == 0) continue;
+        if (strcmp(comp, "..") == 0) {
+            if (cur->parent) cur = cur->parent;
+            continue;
+        }
+
+        fs_node_t *child = find_child(cur, comp);
+        if (!child) {
+            if (cur->child_count >= FS_MAX_CHILDREN) return -1;
+            child = node_alloc();
+            if (!child) return -1;
+            strncpy(child->name, comp, FS_MAX_NAME);
+            child->type = FS_DIR;
+            if (add_child(cur, child) < 0) {
+                node_free(child);
+                return -1;
+            }
+        } else if (child->type != FS_DIR) {
+            return -1;
+        }
+        cur = child;
+    }
+    return 0;
+}
 
 fs_node_t *fs_mkdir(const char *path)
 {
@@ -302,7 +311,7 @@ fs_node_t *fs_mkdir(const char *path)
     fs_node_t *n = node_alloc();
     if (!n) return 0;
 
-    fs_strncpy(n->name, name, FS_MAX_NAME);
+    strncpy(n->name, name, FS_MAX_NAME);
     n->type = FS_DIR;
     if (add_child(parent, n) < 0) {
         node_free(n);
@@ -311,9 +320,7 @@ fs_node_t *fs_mkdir(const char *path)
     return n;
 }
 
-/* ============================================================
- * FS_TOUCH
- * ============================================================ */
+
 
 fs_node_t *fs_touch(const char *path)
 {
@@ -329,7 +336,7 @@ fs_node_t *fs_touch(const char *path)
     fs_node_t *n = node_alloc();
     if (!n) return 0;
 
-    fs_strncpy(n->name, name, FS_MAX_NAME);
+    strncpy(n->name, name, FS_MAX_NAME);
     n->type = FS_FILE;
     n->data = 0;
     n->size = 0;
@@ -340,9 +347,7 @@ fs_node_t *fs_touch(const char *path)
     return n;
 }
 
-/* ============================================================
- * FS_WRITE
- * ============================================================ */
+
 
 int fs_write(const char *path, const char *data, size_t len)
 {
@@ -350,22 +355,50 @@ int fs_write(const char *path, const char *data, size_t len)
     if (!n) n = fs_touch(path);
     if (!n || n->type != FS_FILE) return -1;
 
-    if (n->data) { kfree(n->data); n->data = 0; n->size = 0; }
+    if (n->data && !n->is_const) { kfree(n->data); }
+    n->data = 0;
+    n->size = 0;
+    n->is_const = 0;
 
     if (len == 0) return 0;
 
     n->data = kmalloc(len + 1);
     if (!n->data) { n->size = 0; return -1; }
 
-    fs_memcpy(n->data, data, len);
+    memcpy(n->data, data, len);
     n->data[len] = '\0';
     n->size = len;
     return 0;
 }
 
-/* ============================================================
- * FS_CAT
- * ============================================================ */
+int fs_mount_const(const char *path, const uint8_t *data, size_t len)
+{
+    if (!path || !path[0]) return -1;
+
+    /* Ensure parent directories exist */
+    char tmp[FS_MAX_PATH];
+    strncpy(tmp, path, FS_MAX_PATH);
+    int slash = -1;
+    for (int i = (int)strlen(tmp) - 1; i >= 0; i--) {
+        if (tmp[i] == '/') { slash = i; break; }
+    }
+    if (slash > 0) {
+        tmp[slash] = '\0';
+        fs_mkdir_p(tmp);
+    }
+
+    fs_node_t *n = fs_resolve(path);
+    if (!n) n = fs_touch(path);
+    if (!n || n->type != FS_FILE) return -1;
+
+    if (n->data && !n->is_const) { kfree(n->data); }
+    n->data = (uint8_t *)data;
+    n->size = len;
+    n->is_const = 1;
+    return 0;
+}
+
+
 
 int fs_cat(const char *path, char *buf, size_t bufsz)
 {
@@ -374,14 +407,12 @@ int fs_cat(const char *path, char *buf, size_t bufsz)
     if (!n || n->type != FS_FILE) return -1;
 
     size_t copy = (n->size < bufsz - 1) ? n->size : bufsz - 1;
-    if (n->data && copy > 0) fs_memcpy(buf, n->data, copy);
+    if (n->data && copy > 0) memcpy(buf, n->data, copy);
     buf[copy] = '\0';
     return 0;
 }
 
-/* ============================================================
- * FS_RM
- * ============================================================ */
+
 
 int fs_rm(const char *path)
 {
@@ -406,9 +437,7 @@ int fs_rm(const char *path)
     return 0;
 }
 
-/* ============================================================
- * FS_CP
- * ============================================================ */
+
 
 int fs_cp(const char *src, const char *dst)
 {
@@ -428,16 +457,14 @@ int fs_cp(const char *src, const char *dst)
         d->data = kmalloc(s->size + 1);
         if (!d->data) return -1;
 
-        fs_memcpy(d->data, s->data, s->size);
+        memcpy(d->data, s->data, s->size);
         d->data[s->size] = '\0';
         d->size = s->size;
     }
     return 0;
 }
 
-/* ============================================================
- * FS_MV
- * ============================================================ */
+
 
 int fs_mv(const char *src, const char *dst)
 {
@@ -463,14 +490,12 @@ int fs_mv(const char *src, const char *dst)
 
     /* Detach from old parent, attach to new */
     remove_child(s->parent, s);
-    fs_strncpy(s->name, new_name, FS_MAX_NAME);
+    strncpy(s->name, new_name, FS_MAX_NAME);
     add_child(new_parent, s);
     return 0;
 }
 
-/* ============================================================
- * FS_LS
- * ============================================================ */
+
 
 void fs_ls(const char *path, char *buf, size_t bufsz)
 {
@@ -478,7 +503,7 @@ void fs_ls(const char *path, char *buf, size_t bufsz)
     fs_node_t *dir = path ? fs_resolve(path) : cwd_node;
     if (!dir || dir->type != FS_DIR)
     {
-        fs_strncpy(buf, "not a directory\n", bufsz);
+        strncpy(buf, "not a directory\n", bufsz);
         return;
     }
 
@@ -486,7 +511,7 @@ void fs_ls(const char *path, char *buf, size_t bufsz)
 
     if (dir->child_count == 0)
     {
-        fs_strncpy(buf, "(empty)\n", bufsz);
+        strncpy(buf, "(empty)\n", bufsz);
         return;
     }
 
@@ -499,9 +524,7 @@ void fs_ls(const char *path, char *buf, size_t bufsz)
     }
 }
 
-/* ============================================================
- * DEFAULT SYSTEM & USER DOCUMENTATION FILES
- * ============================================================ */
+
 
 static void fs_init_default_files(void)
 {

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# ArchaOS Standalone C Application Compiler
+# Compiles standard C source files into standalone 32-bit ELF executables for ArchaOS.
+# Supports multiple .c files that depend on each other, header includes, and libraries.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+USER_INC="$REPO_ROOT/user/include"
+USER_LIB="$REPO_ROOT/user/lib"
+LINKER_SCRIPT="$REPO_ROOT/user/linker.ld"
+CRT0_OBJ="$REPO_ROOT/build/user/crt0.o"
+LIBC_OBJ="$REPO_ROOT/build/user/libc.o"
+GUI_OBJ="$REPO_ROOT/build/user/gui.o"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: archaos-cc <file1.c> [file2.c ...] [-o output.elf] [-I<dir>]"
+    echo ""
+    echo "Compiles one or more C source files into a standalone ArchaOS ELF binary."
+    echo "Supports multiple interdependent .c files, custom headers, and libraries."
+    echo "Includes standard <stdio.h>, <stdlib.h>, <string.h>, <unistd.h>, <archaos.h>, and <gui.h>."
+    exit 1
+fi
+
+SRCS=()
+INC_DIRS=()
+EXTRA_CFLAGS=()
+OUT="a.out.elf"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            OUT="$2"
+            shift 2
+            ;;
+        -I*)
+            INC_DIRS+=("$1")
+            shift
+            ;;
+        -D*|-O*|-g*|-W*)
+            EXTRA_CFLAGS+=("$1")
+            shift
+            ;;
+        *)
+            if [ -f "$1" ]; then
+                SRCS+=("$1")
+            else
+                echo "archaos-cc: error: input file '$1' not found."
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ ${#SRCS[@]} -eq 0 ]; then
+    echo "archaos-cc: error: no input source files specified."
+    exit 1
+fi
+
+# Ensure user runtime crt0, libc, and gui toolkit are built
+if [ ! -f "$CRT0_OBJ" ] || [ ! -f "$LIBC_OBJ" ] || [ ! -f "$GUI_OBJ" ]; then
+    echo "archaos-cc: building ArchaOS user runtime..."
+    mkdir -p "$REPO_ROOT/build/user"
+    nasm -f elf32 "$REPO_ROOT/user/crt0.asm" -o "$CRT0_OBJ"
+    gcc -m32 -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -mstackrealign -nostdlib -Wall -Wextra -O2 -I"$USER_INC" -I"$USER_LIB" -c "$USER_LIB/libc.c" -o "$LIBC_OBJ"
+    gcc -m32 -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -mstackrealign -nostdlib -Wall -Wextra -O2 -I"$USER_INC" -I"$USER_LIB" -c "$USER_LIB/gui.c" -o "$GUI_OBJ"
+fi
+
+TMP_OBJS=()
+cleanup() {
+    for obj in "${TMP_OBJS[@]}"; do
+        rm -f "$obj"
+    done
+}
+trap cleanup EXIT
+
+# Compile each source file into a freestanding 32-bit ELF object
+for src in "${SRCS[@]}"; do
+    case "$src" in
+        *.c)
+            # Add directory of each source file to include path for relative #include resolution
+            src_dir="$(cd "$(dirname "$src")" && pwd)"
+            obj="/tmp/$(basename "$src" .c)_$$_$RANDOM.o"
+            gcc -m32 -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -mstackrealign -nostdlib -Wall -Wextra -O2 \
+                -I"$USER_INC" -I"$USER_LIB" -I"$src_dir" "${INC_DIRS[@]}" "${EXTRA_CFLAGS[@]}" \
+                -c "$src" -o "$obj"
+            TMP_OBJS+=("$obj")
+            ;;
+        *.o)
+            TMP_OBJS+=("$src")
+            ;;
+        *)
+            echo "archaos-cc: warning: skipping unrecognized file '$src'"
+            ;;
+    esac
+done
+
+if [ ${#TMP_OBJS[@]} -eq 0 ]; then
+    echo "archaos-cc: error: no compilable source objects."
+    exit 1
+fi
+
+# Link all user objects together with crt0, libc, and gui toolkit into final standalone ELF binary
+ld -m elf_i386 -T "$LINKER_SCRIPT" --oformat=elf32-i386 -o "$OUT" "$CRT0_OBJ" "$LIBC_OBJ" "$GUI_OBJ" "${TMP_OBJS[@]}"
+
+echo "archaos-cc: successfully built '$OUT' from ${#SRCS[@]} source file(s): ${SRCS[*]}"

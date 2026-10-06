@@ -41,4 +41,10 @@ void vga_font_backup_save(uint8_t *font_buf);
 void vga_restore_text_palette(void);
 void vga_restore_font_and_text(uint8_t *font_buf);
 
+/* High-Resolution VESA Terminal Console */
+int  vesa_term_is_active(void);
+void vesa_term_enter(void);
+void vesa_term_exit(void);
+void vesa_term_redraw_screen(void);
+
 #endif

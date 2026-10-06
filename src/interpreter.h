@@ -7,5 +7,6 @@
 void interpreter_init(void);
 void interpreter_run_python(const char *code);
 void interpreter_run_c(const char *code);
+void cmd_python(const char *args);
 
 #endif

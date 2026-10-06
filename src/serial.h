@@ -1,4 +1,3 @@
-// src/serial.h — 16550 UART driver
 #ifndef SERIAL_H
 #define SERIAL_H
 

@@ -1,4 +1,3 @@
-// src/video.c — ArchaOS Universal Video Player & Motion Engine
 #include "video.h"
 #include "mm.h"
 #include "pit.h"
@@ -152,9 +151,7 @@ static void render_current_frame(void) {
     }
 }
 
-/* ============================================================
- * UNIVERSAL ANIMATED GIF VIDEO DECODER
- * ============================================================ */
+
 static int video_decode_gif(const uint8_t *data, size_t len, const char *source_name) {
     if (!data || len < 6) return 0;
     if (data[0] != 'G' || data[1] != 'I' || data[2] != 'F' || data[3] != '8') return 0;
@@ -235,9 +232,7 @@ static int video_decode_gif(const uint8_t *data, size_t len, const char *source_
     return 1;
 }
 
-/* ============================================================
- * UNIVERSAL MPEG-1 VIDEO DECODER
- * ============================================================ */
+
 static int video_decode_mpeg(const uint8_t *data, size_t len, const char *source_name) {
     if (!data || len < 4) return 0;
     int is_mpeg = (data[0] == 0x00 && data[1] == 0x00 && data[2] == 0x01 && (data[3] == 0xBA || data[3] == 0xB3));
@@ -323,9 +318,7 @@ static int video_decode_mpeg(const uint8_t *data, size_t len, const char *source
     return 1;
 }
 
-/* ============================================================
- * ARCHAOS AVID CONTAINER DECODER
- * ============================================================ */
+
 static int video_decode_avid(const uint8_t *data, size_t len, const char *source_name) {
     video_stop();
     if (video_raw_data) {
@@ -370,9 +363,7 @@ static int video_decode_avid(const uint8_t *data, size_t len, const char *source
     return 1;
 }
 
-/* ============================================================
- * MP4 / WEBM CONTAINER PARSER & MOTION PREVIEW
- * ============================================================ */
+
 static int video_decode_container(const uint8_t *data, size_t len, const char *source_name) {
     if (!data || len < 16) return 0;
     int is_mp4 = (len >= 12 && data[4] == 'f' && data[5] == 't' && data[6] == 'y' && data[7] == 'p');

@@ -1,4 +1,3 @@
-// src/ata.h — ATA/IDE PIO driver interface
 #ifndef ATA_H
 #define ATA_H
 

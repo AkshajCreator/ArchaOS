@@ -1,4 +1,3 @@
-// src/audio.c — ArchaOS Universal Audio Engine & Synthesizer
 #include "audio.h"
 #include "pit.h"
 #include "mm.h"
@@ -23,10 +22,79 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-/* Speaker Hardware Control */
+/* Speaker & OPL3 FM Synthesizer Control */
 static uint8_t  speaker_active = 0;
 static uint32_t current_freq   = 0;
 static int      sb16_detected  = -1; /* -1 = untested, 0 = no, 1 = yes */
+static int      opl_initialized = 0;
+
+static void opl_write(uint8_t reg, uint8_t val) {
+    outb(0x388, reg);
+    for (volatile int i = 0; i < 6; i++) inb(0x388);
+    outb(0x389, val);
+    for (volatile int i = 0; i < 35; i++) inb(0x388);
+}
+
+static void opl_init(void) {
+    if (opl_initialized) return;
+
+    /* Clear OPL2/3 registers 0x01 to 0xF5 */
+    for (int i = 1; i <= 0xF5; i++) {
+        opl_write((uint8_t)i, 0x00);
+    }
+
+    /* Enable OPL2 wave selection */
+    opl_write(0x01, 0x20);
+
+    /* Channel 0: Operator 1 (Modulator) */
+    opl_write(0x20, 0x01); /* Mult = 1 */
+    opl_write(0x40, 0x10); /* Modulator level */
+    opl_write(0x60, 0xF0); /* Attack = F, Decay = 0 */
+    opl_write(0x80, 0x77); /* Sustain = 7, Release = 7 */
+    opl_write(0xE0, 0x00); /* Sine wave */
+
+    /* Channel 0: Operator 2 (Carrier) */
+    opl_write(0x23, 0x01); /* Mult = 1 */
+    opl_write(0x43, 0x00); /* Maximum volume */
+    opl_write(0x63, 0xF0); /* Attack = F, Decay = 0 */
+    opl_write(0x83, 0x77); /* Sustain = 7, Release = 7 */
+    opl_write(0xE3, 0x00); /* Sine wave */
+
+    /* Feedback & connection: FM synthesis mode */
+    opl_write(0xC0, 0x01);
+
+    opl_initialized = 1;
+}
+
+static void opl_play_freq(uint32_t freq_hz) {
+    if (!opl_initialized) opl_init();
+    if (freq_hz == 0) {
+        opl_write(0xB0, 0x00); /* Key OFF */
+        return;
+    }
+
+    /* Determine octave (block 1 to 7) and frequency number */
+    uint32_t block = 4;
+    if (freq_hz < 130) block = 1;
+    else if (freq_hz < 260) block = 2;
+    else if (freq_hz < 520) block = 3;
+    else if (freq_hz < 1040) block = 4;
+    else if (freq_hz < 2080) block = 5;
+    else if (freq_hz < 4160) block = 6;
+    else block = 7;
+
+    uint32_t f_num = (freq_hz * 659) / (1 << block);
+    if (f_num > 1023) f_num = 1023;
+
+    opl_write(0xA0, (uint8_t)(f_num & 0xFF));
+    opl_write(0xB0, (uint8_t)(0x20 | ((block & 0x07) << 2) | ((f_num >> 8) & 0x03))); /* Key ON */
+}
+
+static void opl_stop(void) {
+    if (opl_initialized) {
+        opl_write(0xB0, 0x00); /* Key OFF */
+    }
+}
 
 static void sb16_init_check(void) {
     if (sb16_detected != -1) return;
@@ -38,11 +106,15 @@ static void sb16_init_check(void) {
     uint8_t ack = inb(0x22A);
     if (ack == 0xAA) {
         sb16_detected = 1;
-        serial_puts(COM1_BASE, "[Audio] Sound Blaster 16 DSP detected at 0x220\n");
+        /* Turn SB16 speaker ON: DSP command 0xD1 */
+        for (int spin = 0; spin < 1000 && (inb(0x22C) & 0x80); spin++) {}
+        outb(0x22C, 0xD1);
+        serial_puts(COM1_BASE, "[Audio] Sound Blaster 16 DSP & OPL3 FM Synthesizer detected at 0x220/0x388\n");
     } else {
         sb16_detected = 0;
         serial_puts(COM1_BASE, "[Audio] PC Speaker Universal Synthesis Active\n");
     }
+    opl_init();
 }
 
 void audio_play_freq(uint32_t freq_hz) {
@@ -51,6 +123,11 @@ void audio_play_freq(uint32_t freq_hz) {
         return;
     }
     current_freq = freq_hz;
+
+    /* 1. Play tone via Sound Blaster 16 OPL3 FM Synthesizer */
+    opl_play_freq(freq_hz);
+
+    /* 2. Play tone via PC Speaker (PIT Counter 2) */
     uint32_t div = 1193180 / freq_hz;
     outb(0x43, 0xB6);
     outb(0x42, (uint8_t)(div & 0xFF));
@@ -65,6 +142,10 @@ void audio_play_freq(uint32_t freq_hz) {
 static uint32_t last_dac_idx = 0;
 
 void audio_stop(void) {
+    /* 1. Silence OPL3 FM Synthesizer */
+    opl_stop();
+
+    /* 2. Silence PC Speaker */
     if (speaker_active) {
         outb(0x61, inb(0x61) & ~3);
         speaker_active = 0;
@@ -73,9 +154,7 @@ void audio_stop(void) {
     last_dac_idx = 0;
 }
 
-/* ============================================================
- * UNIVERSAL AUDIO STATE
- * ============================================================ */
+
 
 static audio_state_t player_state = AUDIO_STATE_STOPPED;
 static char     cur_source[128] = "None";
@@ -127,9 +206,7 @@ static const char *str_find(const char *haystack, const char *needle) {
     return NULL;
 }
 
-/* ============================================================
- * WAV FILE PARSER
- * ============================================================ */
+
 
 int audio_parse_wav(const uint8_t *data, size_t len, wav_header_t *out_hdr, const uint8_t **out_pcm_data) {
     if (!data || len < 44 || !out_hdr) return 0;
@@ -179,9 +256,7 @@ int audio_parse_wav(const uint8_t *data, size_t len, wav_header_t *out_hdr, cons
     return 1;
 }
 
-/* ============================================================
- * UNIVERSAL MEDIA LOADER (WAV, OGG Vorbis, AU, RAW PCM)
- * ============================================================ */
+
 
 static void format_snprintf(char *buf, size_t sz, const char *fmt_name, uint32_t rate, int ch, uint32_t kb) {
     (void)kb;
@@ -523,9 +598,7 @@ int audio_open(const char *url_or_path) {
     return 0;
 }
 
-/* ============================================================
- * PLAYBACK CONTROLS
- * ============================================================ */
+
 
 void audio_init(void) {
     audio_stop();
@@ -627,9 +700,7 @@ uint32_t audio_get_elapsed_ms(void) {
     return 0;
 }
 
-/* ============================================================
- * AUDIO STEP ENGINE (Speaker Output & Pitch Tracking)
- * ============================================================ */
+
 
 void audio_step(uint32_t now_ticks) {
     if (player_state != AUDIO_STATE_PLAYING || !pcm_samples || pcm_sample_count == 0) return;
@@ -692,9 +763,7 @@ void audio_step(uint32_t now_ticks) {
     }
 }
 
-/* ============================================================
- * REAL-TIME VISUALIZER (Spectrum Analyzer & Waveform)
- * ============================================================ */
+
 
 void audio_get_spectrum(uint8_t *bars, int num_bars) {
     if (!bars || num_bars <= 0) return;
@@ -759,4 +828,55 @@ void audio_get_waveform(int8_t *samples, int num_samples) {
             samples[i] = 0;
         }
     }
+}
+
+int audio_write_pcm(const void *pcm_data, size_t bytes, int channels, int sample_rate, int bits_per_sample) {
+    if (!pcm_data || bytes == 0) return 0;
+    if (channels <= 0) channels = 1;
+    if (sample_rate <= 0) sample_rate = 22050;
+    if (bits_per_sample != 8 && bits_per_sample != 16) bits_per_sample = 16;
+
+    sb16_init_check();
+
+    size_t bytes_per_frame = (size_t)channels * (bits_per_sample / 8);
+    if (bytes_per_frame == 0) return 0;
+    size_t num_frames = bytes / bytes_per_frame;
+    if (num_frames == 0) return 0;
+
+    if (num_frames > 512) num_frames = 512;
+
+    if (sb16_detected == 1) {
+        for (size_t i = 0; i < num_frames; i++) {
+            uint8_t u8 = 128;
+            if (bits_per_sample == 16) {
+                const int16_t *s16 = (const int16_t *)pcm_data;
+                int mono = 0;
+                if (channels >= 2) {
+                    mono = ((int)s16[i * channels] + (int)s16[i * channels + 1]) / 2;
+                } else {
+                    mono = (int)s16[i];
+                }
+                mono = (mono * volume_level) / 100;
+                u8 = (uint8_t)((mono >> 8) + 128);
+            } else {
+                const uint8_t *s8 = (const uint8_t *)pcm_data;
+                int mono = 0;
+                if (channels >= 2) {
+                    mono = ((int)s8[i * channels] + (int)s8[i * channels + 1]) / 2;
+                } else {
+                    mono = (int)s8[i];
+                }
+                mono = (((mono - 128) * volume_level) / 100) + 128;
+                u8 = (uint8_t)mono;
+            }
+
+            for (int spin = 0; spin < 50 && (inb(0x22C) & 0x80); spin++) {}
+            outb(0x22C, 0x10); /* SB16 direct DAC command */
+            for (int spin = 0; spin < 50 && (inb(0x22C) & 0x80); spin++) {}
+            outb(0x22C, u8);
+        }
+        return (int)num_frames;
+    }
+
+    return (int)num_frames;
 }

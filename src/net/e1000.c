@@ -6,24 +6,10 @@
 #include "e1000.h"
 #include "../pci.h"
 #include "../serial.h"
+#include "../vmm.h"
+#include "../string.h"
 #include <stdint.h>
 #include <stddef.h>
-
-/* ============================================================
- * Minimal memory utilities (no libc in freestanding env)
- * ============================================================ */
-static void e_memset(void *dst, uint8_t val, uint32_t n)
-{
-    uint8_t *p = (uint8_t *)dst;
-    while (n--) *p++ = val;
-}
-
-static void e_memcpy(void *dst, const void *src, uint32_t n)
-{
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    while (n--) *d++ = *s++;
-}
 
 /* ============================================================
  * Driver State
@@ -151,6 +137,7 @@ int e1000_init(void)
         return 0;
     }
     e1000_mmio = (uint8_t *)(bar0 & 0xFFFFFFF0);
+    vmm_map_mmio((uint32_t)e1000_mmio, 128 * 1024);
 
     serial_printf(COM1_BASE, "[E1000] Found vendor=%04x dev=%04x MMIO=0x%08x\n",
                   dev->vendor_id, dev->device_id, (uint32_t)e1000_mmio);
@@ -200,7 +187,7 @@ int e1000_init(void)
     /* ================================================================
      * RX Ring Setup
      * ================================================================ */
-    e_memset(rx_descs, 0, sizeof(rx_descs));
+    memset(rx_descs, 0, sizeof(rx_descs));
     for (int i = 0; i < E1000_NUM_RX_DESC; i++) {
         rx_descs[i].addr   = (uint64_t)(uint32_t)rx_bufs[i];
         rx_descs[i].status = 0;
@@ -230,7 +217,7 @@ int e1000_init(void)
     /* ================================================================
      * TX Ring Setup
      * ================================================================ */
-    e_memset(tx_descs, 0, sizeof(tx_descs));
+    memset(tx_descs, 0, sizeof(tx_descs));
     for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
         tx_descs[i].addr   = (uint64_t)(uint32_t)tx_bufs[i];
         tx_descs[i].status = E1000_TXD_STAT_DD; /* Mark all as done initially */
@@ -272,7 +259,7 @@ int e1000_is_active(void)
  * ============================================================ */
 void e1000_get_mac(uint8_t mac[6])
 {
-    e_memcpy(mac, e1000_mac, 6);
+    memcpy(mac, e1000_mac, 6);
 }
 
 /* ============================================================
@@ -296,7 +283,7 @@ int e1000_send(const void *data, uint16_t len)
     }
 
     /* Copy payload into the static TX buffer */
-    e_memcpy(tx_bufs[idx], data, len);
+    memcpy(tx_bufs[idx], data, len);
 
     /* Fill descriptor */
     tx_descs[idx].addr   = (uint64_t)(uint32_t)tx_bufs[idx];
@@ -330,7 +317,7 @@ uint16_t e1000_recv(void *buf)
     uint16_t len = rx_descs[idx].length;
     if (len > E1000_BUF_SIZE) len = E1000_BUF_SIZE;
 
-    e_memcpy(buf, rx_bufs[idx], len);
+    memcpy(buf, rx_bufs[idx], len);
 
     /* Return descriptor to hardware */
     rx_descs[idx].status = 0;
